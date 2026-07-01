@@ -247,11 +247,11 @@
 - 대시보드 시트의 경우, 텍스트 상자의 위치를 자유롭게 배치하기 때문에, 텍스트 삽입 자동화가 어려움
 - 따라서, 별도의 대시보드 텍스트 취합용xlsx 파일을 만들어 부서에서 추가한 내용을 **빨간색 배경색**으로 표시함 → 관리자가 확인 후, 대시보드 차트 내에 추가
     
-    !대시보드 취합본 엑셀 파일
+    <img width="905" height="53" alt="Image" src="https://github.com/user-attachments/assets/e1a857da-61c6-4b7e-8ca1-6b3fe5acc7c8" />
     
     대시보드 취합본 엑셀 파일
     
-    !대시보드 취합본 엑셀 파일 - 부서에서 추가한 내용은 빨간색 배경으로 표시
+  <img width="1707" height="768" alt="Image" src="https://github.com/user-attachments/assets/ec2c53f5-4110-4d31-84ab-0f245da020bb" />
     
     대시보드 취합본 엑셀 파일 - 부서에서 추가한 내용은 빨간색 배경으로 표시
     
@@ -283,9 +283,9 @@
 1. aggregate_numeric_sheets 
 2. 실행 결과 : 
     
-    !image.png
+    <img width="497" height="559" alt="Image" src="https://github.com/user-attachments/assets/23991a43-a4e0-49d7-849d-fb546a3de42b" />
     
-    !image.png
+   <img width="633" height="547" alt="Image" src="https://github.com/user-attachments/assets/44ceb6df-507f-4ee4-a958-31e7b9ff6635" />
     
     - 시트 끼리(취합본 파일의 시트 + 부서별 파일의 시트), **인덱스 기반**으로 수정된 셀을 찾아 수정된 값과 파란색 배경색으로 대체 / 행 추가 및 삭제 + 레이아웃 셀 서식 유지
     
@@ -295,7 +295,7 @@
 1. aggregate_text_sheets
 2. 실행 결과
     
-    !image.png
+   <img width="584" height="230" alt="Image" src="https://github.com/user-attachments/assets/fcdc068c-651c-427d-9438-e15511a8a0e0" />
     
     - 시트끼리 (취합본 파일의 시트 + 부서별 파일의 시트),  **행 탐색 기반**으로 수정된 셀을 찾아 수정된 값과 파란색 배경색으로 대체
     
