@@ -41,11 +41,11 @@
             
         2. 부서별로 행을 추가한 경우 → 취합본 파일의 인덱스 열에 연두색으로 표시
             
-            !image.png
+            <img width="225" height="144" alt="Image" src="https://github.com/user-attachments/assets/40f9ed57-70b0-4740-a80b-20a16c671c2b" />
             
         3. 부서별로 행을 삭제한 경우 → 취합본 파일의 인덱스 열에 연한 빨간색으로 표시
             
-            !image.png
+            <img width="219" height="146" alt="Image" src="https://github.com/user-attachments/assets/1e6c493f-36c5-4bae-b9bd-b797717550e8" />
             
 4. 9개 파일+ 시트 7개 (총 63개 sheet) 취합에 걸린 총 시간 : (2026-07-01 기준)
     
