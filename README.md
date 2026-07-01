@@ -37,7 +37,7 @@
     6. 색상
         1. 부서별로 수정된 셀 → 취합본 파일의 수정된 셀에 파란색 으로 표시 
             
-            !image.png
+            <img width="229" height="150" alt="Image" src="https://github.com/user-attachments/assets/0865d094-f9ba-44e9-9e99-e61b18937c50" />
             
         2. 부서별로 행을 추가한 경우 → 취합본 파일의 인덱스 열에 연두색으로 표시
             
