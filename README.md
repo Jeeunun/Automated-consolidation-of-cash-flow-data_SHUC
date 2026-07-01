@@ -63,18 +63,18 @@
     
     https://www.python.org/downloads/release/python-3120/
     
-    !image.png
+    <img width="1261" height="645" alt="Image" src="https://github.com/user-attachments/assets/3f682496-f62b-4774-b1d1-a05b8d7349a5" />
     
     - Set-up
         - Path 추가
             
-            !image.png
+            <img width="650" height="403" alt="Image" src="https://github.com/user-attachments/assets/3aaa2d0b-183b-4d59-8547-12baa6ee35be" />
             
             - **❗주의 :  반드시 Add python.exe to PATH 누르기!!**
             - IDLE 자동 설치
 2. Package 설치
     
-    !image.png
+    <img width="774" height="675" alt="Image" src="https://github.com/user-attachments/assets/b1cd8e37-19c2-4cae-9ed7-0ede38c0a423" />
     
     - cmd 실행
     - 명령문 입력
@@ -86,14 +86,14 @@
         
         - 실행 결과
             
-            !image.png
+            <img width="1092" height="346" alt="Image" src="https://github.com/user-attachments/assets/7b78e5ff-8942-46f7-8d62-ae33aef0fbb1" />
             
             - [notice] To update, run : python.exe -m pip install —upgrade pip 가 뜨면, python.exe -m pip install —upgrade pip 도 실행
             (Ctrl+Shift+C, Ctrl+Shift+V 복사 붙여넣기 가능)
             
 3. 부서별 파일 같은 경로에 저장
     
-    !예시 폴더
+    <img width="1006" height="390" alt="Image" src="https://github.com/user-attachments/assets/e3c8ec04-3563-49fd-b074-6efb8764e36b" />
     
     예시 폴더
     
