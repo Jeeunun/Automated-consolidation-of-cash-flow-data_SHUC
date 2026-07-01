@@ -1,4 +1,4 @@
-"# Automated-consolidation-of-cash-flow-data_SHUC" 
+# Automated-consolidation-of-cash-flow-data_SHUC" 
 # 현금흐름 엑셀 데이터 취합 자동화 매뉴얼
 
 <aside>
@@ -308,7 +308,7 @@
 4. 대시보드 내 부서에서 추가한 내용을 취합하여 저장하는 함수
 5. 실행 결과
     
-    !image.png
+   <img width="731" height="126" alt="Image" src="https://github.com/user-attachments/assets/9641c365-7340-457f-b099-5bb9a15e7164" />
     
 
 ---
@@ -317,14 +317,14 @@
 
 ### 1. 실행 전, utils.py 에서 폴더경로와 파일명 확인
 
-!image.png
+<img width="699" height="44" alt="Image" src="https://github.com/user-attachments/assets/9a75fefd-5527-46a7-84ad-197cc3228f57" />
 
 - base_path : 이 경로에 부서별폴더과 파이썬파일(utils.py, main.py), 취합용 파일이 모두 있어야 함.
 - file_name : 취합용 파일
     - 이미지 내 prev_year_short, prev_month:02d 는 날짜 자동으로 계산하기 위한 변수
 - 최종 파일명 : main.py 코드 내 취합결과 최종 파일명 지정함.
     
-    !image.png
+   <img width="818" height="67" alt="Image" src="https://github.com/user-attachments/assets/9013db48-6aea-4b42-b64e-30e423513c6b" />
     
     - ex.도시개발본부_현금흐름_최종취합(26.05).xlsx
 
@@ -332,9 +332,9 @@
 
 - IDLE 실행 →  File → Open → **main.py 파일** 클릭 → **F5 단축키** 누르기
     
-    !image.png
-    
-    !image.png
+   <img width="325" height="48" alt="Image" src="https://github.com/user-attachments/assets/889ec2bc-81e8-4467-8053-59c14d61554d" />
+   <img width="587" height="597" alt="Image" src="https://github.com/user-attachments/assets/ec115b2e-3e00-495b-a1e3-ba7a2ec299ca" />
+
     
     - **main.py** : utils.py , dashboard.py 내 함수들을 불러와서 숫자 시트, 텍스트 시트, 대시보드 시트 취합을 한번에 **실행**하는 파일
 
