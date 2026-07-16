@@ -22,7 +22,7 @@ import win32com.client as win32
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
-
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 # ---------------------------------------------------------------------------
 # 설정
 # ---------------------------------------------------------------------------
@@ -375,6 +375,13 @@ def save_consolidated_csv(df: pd.DataFrame, csv_path: str):
     os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
     df[export_cols].to_csv(csv_path, index=False, encoding='utf-8-sig')
 
+def _sanitize(val):
+    if isinstance(val, str):
+        return re.sub(ILLGEGAL_CHARACTERS_RE, '', val)
+        # openpyxl은 스칼라(str/숫자/bool/None)만 허용. 그 외(튜플/리스트/객체 등)는 문자열로 강제.
+    if val is None or isinstance(val, (int, float, bool)):
+        return val
+    return re.sub(ILLEGAL_CHARACTERS_RE, '', str(val))
 
 def save_consolidated_xlsx(df: pd.DataFrame, xlsx_path: str):
     """CSV와 동일 데이터 + 부서추가 행 빨간 배경."""
@@ -392,7 +399,7 @@ def save_consolidated_xlsx(df: pd.DataFrame, xlsx_path: str):
     for row_idx, row in enumerate(df.itertuples(index=False), 2):
         is_add = getattr(row, 'status', '') == STATUS_DEPT_ADD
         for col_idx, col_name in enumerate(export_cols, 1):
-            val = getattr(row, col_name, '')
+            val = _sanitize(getattr(row, col_name, ''))
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
             if is_add:
                 cell.fill = FILL_DEPT_ADD
