@@ -191,7 +191,7 @@ def aggregate_numeric_sheets(master_wb, dept_wbs, numeric_sheets):
                 all_dept_indexes.add(idx_str)
 
                 if idx_str in master_map:
-                    # 마스터에 이미 존재하는 인덱스들의 일반 수정셀 취합은 
+                    # 취합용 파일에 이미 존재하는 인덱스들의 일반 수정셀 취합은 
                     # 신규 행 추가가 완료되어 행 번호가 최종 확정된 이후(하단 루프)에 처리합니다.
                     pass
                 else:
@@ -347,7 +347,7 @@ def aggregate_text_sheets(master_wb, dept_wbooks, text_sheets):
                         if not is_blue_cell(dept_cell_raw) and not is_blue_cell(d_eff):
                             continue
 
-                        print(f'  -> [파란색 셀 포착] {r}행 {c}열 변동 감지! 해당 {r}행 전체를 통째로 이식합니다.')
+                        print(f'  -> [파란색 셀 포착] {r}행 {c}열 / 해당 {r}행 전체를 통째로 이식합니다.')
 
                         for copy_c in range(1, max_col + 1):
                             m_cell_raw = master_ws.cell(row=r, column=copy_c)
@@ -369,7 +369,7 @@ def aggregate_text_sheets(master_wb, dept_wbooks, text_sheets):
                         row_replaced = True
                         break
 
-        print(f'>> {sheet_name} 텍스트 취합 완료  / 총 {replace_row_count}개 행 완벽 교체 완료.\n')
+        print(f'>> {sheet_name} 텍스트 취합 완료  / 총 {replace_row_count}개 행 교체 완료.\n')
 
 # ------------------------------------------
 # 실행
@@ -451,8 +451,29 @@ if __name__ == "__main__":
     print("====================================================")
     print(f" 소요 시간: {int(elapsed // 60)}분 {int(elapsed % 60)}초")
 
-    output_file = os.path.join(base_path, f"도시개발본부_현금흐름_최종취합_완성본({prev_year_short}.{prev_month:02d}).xlsx")
+    folder_file = os.path.join(base_path, '최종취합본')
+    os.makedirs(folder_file, exist_ok=True)
+    output_file = os.path.join(folder_file, f"도시개발본부_현금흐름_최종취합_완성본({prev_year_short}.{prev_month:02d}).xlsx")
+
+    # openpyxl이 DashBoard(차트/도형)를 저장하면 xlsx 도면 XML이 깨져
+    # Excel이 '내용을 복구하시겠습니까?'를 띄운다 → 저장 전에 대시보드 시트 제거
+    from dashboard import strip_dashboard_sheets, restore_dashboard_sheets_to_output
+    removed_dash = strip_dashboard_sheets(master_wb)
+    if removed_dash:
+        print(f" openpyxl 안전 저장을 위해 DashBoard 시트 임시 제외: {', '.join(removed_dash)}")
+
     master_wb.save(output_file)
     master_wb.close()
     print(f" 최종 취합본 파일 저장완료 \n -> 경로: {output_file}")
+
+    # 취합용 원본에서 DashBoard(도형·차트·텍스트)를 COM으로 붙임
+    print(" DashBoard 시트 도형·텍스트 복원 중...")
+    try:
+        restored = restore_dashboard_sheets_to_output(master_file, output_file)
+        if restored:
+            print(f" DashBoard 복원 완료: {', '.join(restored)}")
+        else:
+            print(" DashBoard 복원 대상 시트 없음(또는 모두 스킵).")
+    except Exception as e:
+        print(f" DashBoard 복원 실패(숫자/텍스트 취합은 저장됨): {e}")
     print("====================================================")
