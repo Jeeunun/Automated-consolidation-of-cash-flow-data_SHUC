@@ -1,18 +1,3 @@
-"""
-DashBoard 시트 — 차트 위 텍스트 상자 추출 · 전처리 · 부서 diff · 취합본 저장.
-
-- 추출: pywin32 (Shape/TextFrame) — openpyxl 불가
-- 전처리: 줄바꿈 분리, 단위행 제거, 날짜 정렬
-- 취합: 취합용 대비 부서 추가분 → CSV + 빨간 배경 XLSX
-
-Windows + Excel + pywin32 + pandas + openpyxl 필요.
-"""
-from __future__ import annotations
-
-import argparse
-import csv
-import json
-import os
 import re
 import sys
 from contextlib import contextmanager
@@ -29,6 +14,8 @@ from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 DASHBOARD_SHEET_PREFIXES = ('DashBoard', 'Dashboard')
 UNIT_LABEL = '(단위 : 백만원)'
+# '(단위 : 백만원)', '(단위:백만원)' 등 표기 변형
+UNIT_LABEL_RE = re.compile(r'단위\s*[:：]?\s*백만')
 STATUS_EXISTING = '기존'
 STATUS_DEPT_ADD = '부서추가'
 FILL_DEPT_ADD = PatternFill(start_color='FF6666', end_color='FF6666', fill_type='solid')
@@ -36,8 +23,14 @@ HEADER_FONT = Font(bold=True)
 
 OUTPUT_COLUMNS = [
     'status', 'source_file', 'chart_title', 'chart_name', 'text',
-    'top', 'left', 'width', 'height', 'source', 'chart_object',
 ]
+
+# 차트 위 섹션 제목 상자 식별용 (예: "□ 운영자본금", "ㅁ 사업준비금")
+SECTION_HEADER_MARKERS = '□■▢▣◻◼◽◾▪▫●○◎◇◆❑❒ㅁ※·-'
+# 섹션 제목은 날짜·금액 숫자가 없는 짧은 텍스트 (주석은 숫자 포함)
+SECTION_TITLE_MAX_LEN = 30
+# 대시보드 큰 섹션명 (셀/도형에서 우선 매칭)
+SECTION_NAME_KEYWORDS = ('운영자본금', '사업준비금', '부채')
 
 # ---------------------------------------------------------------------------
 # pywin32 — 텍스트 상자 추출
@@ -79,6 +72,46 @@ def _chart_title(chart_obj) -> str:
     return chart_obj.Name
 
 
+def _is_unit_label(text: str) -> bool:
+    """단위 표기('(단위 : 백만원)' 등) 여부."""
+    return bool(UNIT_LABEL_RE.search(str(text or '')))
+
+
+def _cell_section_title_above_chart(ws, chart_obj) -> str:
+    """
+    차트 바로 위 셀에서 섹션명(□ 운영자본금 등)을 읽음.
+    대시보드 섹션 제목이 도형이 아니라 셀에 있는 경우가 많음.
+    """
+    try:
+        tl = chart_obj.TopLeftCell
+        start_row = max(1, int(tl.Row) - 4)
+        end_row = int(tl.Row)
+        start_col = max(1, int(tl.Column) - 1)
+        end_col = int(tl.Column) + 8
+    except Exception:
+        return ''
+
+    candidates = []
+    for r in range(start_row, end_row + 1):
+        for c in range(start_col, end_col + 1):
+            try:
+                val = ws.Cells(r, c).Value
+            except Exception:
+                continue
+            if val is None:
+                continue
+            text = str(val).strip()
+            if not text or _is_unit_label(text):
+                continue
+            if _looks_like_section_header(text) or _match_section_keyword(text):
+                # 차트에 더 가까운 행을 우선
+                candidates.append((end_row - r, c, text))
+    if not candidates:
+        return ''
+    candidates.sort()
+    return _clean_section_title(candidates[0][2])
+
+
 def extract_dashboard_data(excel_path, sheet_name, excel_app=None, include_chart_shapes=True):
     excel_path = os.path.abspath(excel_path)
     if not os.path.isfile(excel_path):
@@ -102,6 +135,7 @@ def extract_dashboard_data(excel_path, sheet_name, excel_app=None, include_chart
             charts.append({
                 'name': chart_obj.Name,
                 'title': _chart_title(chart_obj),
+                'cell_title': _cell_section_title_above_chart(ws, chart_obj),
                 'top': float(chart_obj.Top),
                 'left': float(chart_obj.Left),
                 'width': float(chart_obj.Width),
@@ -209,16 +243,20 @@ def extract_sort_key(text: str) -> str:
     return date_part
 
 
+def _flatten_shape_text(text: str) -> str:
+    """도형 하나의 텍스트에서 줄바꿈을 없애고 한 줄로 합침 (단위행 제외)."""
+    lines = [ln.strip() for ln in str(text).split('\n')]
+    lines = [ln for ln in lines if ln and not _is_unit_label(ln) and ln != UNIT_LABEL]
+    return ' '.join(lines)
+
+
 def process_textboxes_df(df: pd.DataFrame) -> pd.DataFrame:
-    """줄바꿈 분리 · 단위행 제거 · chart+날짜 정렬."""
+    """도형별 줄바꿈 제거(한 셀) · 단위행 제거 · chart+날짜 정렬."""
     if df.empty:
         return df.copy()
 
     out = df.copy()
-    out['text'] = out['text'].astype(str).str.split('\n')
-    out = out.explode('text').reset_index(drop=True)
-    out['text'] = out['text'].str.strip()
-    out = out[out['text'] != UNIT_LABEL]
+    out['text'] = out['text'].astype(str).map(_flatten_shape_text)
     out = out[out['text'] != ''].reset_index(drop=True)
     out['text_norm'] = out['text'].map(normalize_text)
     out['sort_key'] = out['text'].map(extract_sort_key)
@@ -263,6 +301,86 @@ def _in_bounds(cy, cx, region, margin=12):
     )
 
 
+def _clean_section_title(text: str) -> str:
+    """섹션 제목 상자/셀 텍스트에서 머리기호를 떼고 실제 제목만 반환."""
+    first = str(text).split('\n')[0].strip()
+    return first.lstrip(SECTION_HEADER_MARKERS + ' \t').strip()
+
+
+def _match_section_keyword(text: str) -> str:
+    """알려진 섹션 키워드가 포함되면 정규화된 섹션명 반환."""
+    core = _clean_section_title(text)
+    if not core or _is_unit_label(core):
+        return ''
+    for kw in SECTION_NAME_KEYWORDS:
+        if kw in core:
+            # '부채(공사채) 발행잔고'처럼 키워드를 포함한 전체 제목 유지
+            return core
+    return ''
+
+
+def _looks_like_section_header(text: str) -> bool:
+    """
+    '□ 운영자본금'·'ㅁ 사업준비금'·'부채(공사채) 발행잔고' 등 섹션 제목 판별.
+    '(단위 : 백만원)' 및 날짜/금액 주석은 제외.
+    """
+    s = str(text).strip()
+    if not s or _is_unit_label(s):
+        return False
+    if _match_section_keyword(s):
+        return True
+    core = _clean_section_title(s)
+    if not core or _is_unit_label(core):
+        return False
+    if core.startswith('('):
+        return False
+    if any(ch.isdigit() for ch in core):
+        return False
+    return len(core) <= SECTION_TITLE_MAX_LEN
+
+
+def _pick_chart_section_title(chart, shape_title: str) -> str:
+    """셀 제목 → 도형 제목 → (단위 제외) 차트 제목 순으로 섹션명 선택."""
+    for cand in (
+        chart.get('cell_title', ''),
+        shape_title,
+        chart.get('title', ''),
+    ):
+        if not cand or _is_unit_label(cand):
+            continue
+        kw = _match_section_keyword(cand)
+        if kw:
+            return kw
+        if _looks_like_section_header(cand):
+            return _clean_section_title(cand)
+    # 차트 객체명(Chart 1 등)은 쓰지 않음 — 단위/빈 값 방지
+    return ''
+
+
+def _assign_section_titles(text_boxes, charts):
+    """
+    차트별 실제 섹션 제목 결정.
+    우선순위: 차트 위 셀 제목 → 근처 섹션 도형 → 차트 제목(단위 제외).
+    """
+    headers = [it for it in text_boxes if _looks_like_section_header(it['text'])]
+    best = {}  # ci -> (우선순위점수, 거리, 제목) 점수 낮을수록 좋음
+    for h in headers:
+        ci = min(range(len(charts)), key=lambda i: abs(charts[i]['top'] - h['top']))
+        dist = abs(charts[ci]['top'] - h['top'])
+        title = _match_section_keyword(h['text']) or _clean_section_title(h['text'])
+        # 알려진 섹션 키워드가 있으면 우선
+        score = 0 if _match_section_keyword(h['text']) else 1
+        prev = best.get(ci)
+        if prev is None or (score, dist) < (prev[0], prev[1]):
+            best[ci] = (score, dist, title)
+
+    titles = {}
+    for ci, ch in enumerate(charts):
+        shape_title = best[ci][2] if ci in best else ''
+        titles[ci] = _pick_chart_section_title(ch, shape_title)
+    return titles
+
+
 def group_text_boxes_by_chart(text_boxes, charts):
     if not charts:
         for item in text_boxes:
@@ -272,15 +390,22 @@ def group_text_boxes_by_chart(text_boxes, charts):
 
     for item in text_boxes:
         cy, cx = _box_center(item)
-        matched = [ch for ch in charts if _in_bounds(cy, cx, ch)]
+        matched = [i for i, ch in enumerate(charts) if _in_bounds(cy, cx, ch)]
         if len(matched) == 1:
-            ch = matched[0]
+            ci = matched[0]
         elif matched:
-            ch = min(matched, key=lambda c: abs(cy - (c['top'] + c['height'] / 2)))
+            ci = min(matched, key=lambda i: abs(cy - (charts[i]['top'] + charts[i]['height'] / 2)))
         else:
-            ch = min(charts, key=lambda c: abs(cy - (c['top'] + c['height'] / 2)))
-        item['chart_title'] = ch['title']
-        item['chart_name'] = ch['name']
+            ci = min(range(len(charts)), key=lambda i: abs(cy - (charts[i]['top'] + charts[i]['height'] / 2)))
+        item['_chart_idx'] = ci
+
+    chart_titles = _assign_section_titles(text_boxes, charts)
+
+    for item in text_boxes:
+        ci = item.pop('_chart_idx')
+        title = chart_titles.get(ci, '')
+        item['chart_title'] = title
+        item['chart_name'] = title
     return text_boxes
 
 
@@ -318,12 +443,6 @@ def build_consolidated(master_df: pd.DataFrame, dept_results: list[tuple[str, pd
                 'chart_title': getattr(r, 'chart_title', ''),
                 'chart_name': getattr(r, 'chart_name', ''),
                 'text': r.text,
-                'top': getattr(r, 'top', ''),
-                'left': getattr(r, 'left', ''),
-                'width': getattr(r, 'width', ''),
-                'height': getattr(r, 'height', ''),
-                'source': getattr(r, 'source', ''),
-                'chart_object': getattr(r, 'chart_object', ''),
                 'text_norm': r.text_norm,
                 'sort_key': r.sort_key,
             })
@@ -342,12 +461,6 @@ def build_consolidated(master_df: pd.DataFrame, dept_results: list[tuple[str, pd
                 'chart_title': getattr(r, 'chart_title', ''),
                 'chart_name': getattr(r, 'chart_name', ''),
                 'text': r.text,
-                'top': getattr(r, 'top', ''),
-                'left': getattr(r, 'left', ''),
-                'width': getattr(r, 'width', ''),
-                'height': getattr(r, 'height', ''),
-                'source': getattr(r, 'source', ''),
-                'chart_object': getattr(r, 'chart_object', ''),
                 'text_norm': r.text_norm,
                 'sort_key': r.sort_key,
             })
@@ -370,21 +483,14 @@ def _dept_label(dept_path: str) -> str:
     return base.strip() or os.path.basename(dept_path)
 
 
-def save_consolidated_csv(df: pd.DataFrame, csv_path: str):
-    export_cols = [c for c in OUTPUT_COLUMNS if c in df.columns]
-    os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
-    df[export_cols].to_csv(csv_path, index=False, encoding='utf-8-sig')
-
 def _sanitize(val):
-    if isinstance(val, str):
-        return re.sub(ILLGEGAL_CHARACTERS_RE, '', val)
-        # openpyxl은 스칼라(str/숫자/bool/None)만 허용. 그 외(튜플/리스트/객체 등)는 문자열로 강제.
+    # openpyxl은 스칼라(str/숫자/bool/None)만 허용. 그 외(튜플/리스트/객체 등)는 문자열로 강제.
     if val is None or isinstance(val, (int, float, bool)):
         return val
     return re.sub(ILLEGAL_CHARACTERS_RE, '', str(val))
 
 def save_consolidated_xlsx(df: pd.DataFrame, xlsx_path: str):
-    """CSV와 동일 데이터 + 부서추가 행 빨간 배경."""
+    """취합 데이터 + 부서추가 행 빨간 배경."""
     export_cols = [c for c in OUTPUT_COLUMNS if c in df.columns]
     os.makedirs(os.path.dirname(os.path.abspath(xlsx_path)), exist_ok=True)
 
@@ -415,12 +521,12 @@ def aggregate_dashboard_consolidation(
     dept_paths,
     output_dir,
     sheet_names=None,
-):
+    ):
     """
-    취합용 + 부서 DashBoard 텍스트 추출·diff·취합본 CSV/XLSX 저장.
+    취합용 + 부서 DashBoard 텍스트 추출·diff·취합본 XLSX 저장.
 
     Returns:
-        dict[sheet_name] -> {'csv': path, 'xlsx': path, 'add_count': int}
+        dict[sheet_name] -> {'xlsx': path, 'add_count': int}
     """
     master_path = os.path.abspath(master_path)
     output_dir = os.path.abspath(output_dir)
@@ -455,18 +561,16 @@ def aggregate_dashboard_consolidation(
             add_count = int((consolidated['status'] == STATUS_DEPT_ADD).sum()) if not consolidated.empty else 0
 
             safe_sheet = re.sub(r'[\\/:*?"<>|]', '_', sheet_name)
-            csv_path = os.path.join(output_dir, f'dashboard_{safe_sheet}_취합본.csv')
-            xlsx_path = os.path.join(output_dir, f'dashboard_{safe_sheet}_취합본.xlsx')
+            folder_file = os.path.join(output_dir, '최종취합본')
+            os.makedirs(folder_file, exist_ok=True)
+            xlsx_path = os.path.join(folder_file, f'dashboard_{safe_sheet}_취합본.xlsx')
 
-            save_consolidated_csv(consolidated, csv_path)
             save_consolidated_xlsx(consolidated, xlsx_path)
 
             print(f'    기존 {len(master_df)}건 / 부서추가 {add_count}건')
-            print(f'    CSV  → {csv_path}')
             print(f'    XLSX → {xlsx_path} (부서추가=빨간 배경)')
 
             results[sheet_name] = {
-                'csv': csv_path,
                 'xlsx': xlsx_path,
                 'add_count': add_count,
                 'rows': len(consolidated),
@@ -475,16 +579,186 @@ def aggregate_dashboard_consolidation(
     return results
 
 
+def strip_dashboard_sheets(workbook) -> list[str]:
+    """
+    openpyxl 워크북에서 DashBoard 시트를 제거한다.
+
+    openpyxl이 차트/도형이 있는 시트를 저장하면 xl/drawings 관계가 깨져
+    Excel이 '내용을 복구하시겠습니까?'를 띄운다.
+    저장 전에 대시보드 시트를 빼 두고, 저장 후 COM으로 취합용 원본을 붙인다.
+    """
+    removed = [
+        name for name in list(workbook.sheetnames)
+        if name.startswith(DASHBOARD_SHEET_PREFIXES)
+    ]
+    for name in removed:
+        del workbook[name]
+    return removed
+
+
+def restore_dashboard_sheets_to_output(master_path, output_path, sheet_names=None, excel_app=None):
+    """
+    취합용(master) DashBoard 시트를 최종 취합본(output)에 붙인다.
+
+    전제: output은 openpyxl 저장 전에 DashBoard가 제거된 '깨끗한' 파일이어야
+    Excel 복구 프롬프트가 뜨지 않는다.
+
+    절차:
+      (1) output에 남아 있는 동명 DashBoard가 있으면 삭제
+      (2) master 시트를 Copy() → Move로 output에 삽입
+      (3) 로컬 temp에 SaveAs 후 최종 경로로 복사 (OneDrive 잠금/동기화 회피)
+
+    Returns: 복원된 시트명 리스트.
+    """
+    import shutil
+    import tempfile
+
+    master_path = os.path.abspath(master_path)
+    output_path = os.path.abspath(output_path)
+    if not os.path.isfile(master_path) or not os.path.isfile(output_path):
+        print('  DashBoard 복원 스킵 — master/output 파일을 찾을 수 없습니다.')
+        return []
+
+    own_excel = excel_app is None
+    if own_excel:
+        excel_app = win32.DispatchEx('Excel.Application')
+        excel_app.Visible = False
+        excel_app.DisplayAlerts = False
+        try:
+            # 자동 복구 UI/알림 억제
+            excel_app.AskToUpdateLinks = False
+            excel_app.AlertBeforeOverwriting = False
+        except Exception:
+            pass
+
+    restored = []
+    out_wb = None
+    mas_wb = None
+    xl_openxml = 51  # xlOpenXMLWorkbook
+    clean_path = os.path.join(
+        tempfile.gettempdir(),
+        f'cashflow_dashboard_restore_{os.getpid()}.xlsx',
+    )
+    try:
+        # UpdateLinks=0: 링크 갱신 안 함 / ReadOnly=False
+        out_wb = excel_app.Workbooks.Open(
+            output_path, UpdateLinks=0, ReadOnly=False, IgnoreReadOnlyRecommended=True,
+        )
+        mas_wb = excel_app.Workbooks.Open(
+            master_path, UpdateLinks=0, ReadOnly=True, IgnoreReadOnlyRecommended=True,
+        )
+
+        out_names = {out_wb.Worksheets(i).Name for i in range(1, out_wb.Worksheets.Count + 1)}
+        mas_names = {
+            mas_wb.Worksheets(i).Name
+            for i in range(1, mas_wb.Worksheets.Count + 1)
+        }
+        if sheet_names is None:
+            # 취합용 시트 순서 유지
+            sheet_names = [
+                mas_wb.Worksheets(i).Name
+                for i in range(1, mas_wb.Worksheets.Count + 1)
+                if mas_wb.Worksheets(i).Name.startswith(DASHBOARD_SHEET_PREFIXES)
+            ]
+
+        excel_app.DisplayAlerts = False
+        for sheet_name in sheet_names:
+            if sheet_name not in mas_names:
+                print(f'  [{sheet_name}] 취합용에 시트가 없어 복원 스킵.')
+                continue
+            try:
+                insert_after = None
+                if sheet_name in out_names:
+                    old = out_wb.Worksheets(sheet_name)
+                    idx = int(old.Index)
+                    if idx > 1:
+                        insert_after = out_wb.Worksheets(idx - 1)
+                    old.Delete()
+                    out_names.discard(sheet_name)
+
+                if out_wb.Worksheets.Count < 1:
+                    out_wb.Worksheets.Add()
+
+                # master → 임시 통합문서(Copy 무인자) → output으로 Move
+                src = mas_wb.Worksheets(sheet_name)
+                src.Copy()
+                temp_sheet = excel_app.ActiveWorkbook.Worksheets(1)
+                if insert_after is not None:
+                    temp_sheet.Move(After=insert_after)
+                else:
+                    # openpyxl 저장 전 제거된 경우 → 맨 뒤에 추가
+                    temp_sheet.Move(After=out_wb.Worksheets(out_wb.Worksheets.Count))
+
+                current_names = {
+                    out_wb.Worksheets(i).Name
+                    for i in range(1, out_wb.Worksheets.Count + 1)
+                }
+                if sheet_name not in current_names:
+                    out_wb.ActiveSheet.Name = sheet_name
+
+                # 도형 복원 여부 확인
+                ws = out_wb.Worksheets(sheet_name)
+                n_shapes = int(ws.Shapes.Count)
+                n_charts = int(ws.ChartObjects().Count)
+                chart_shapes = 0
+                for ci in range(1, n_charts + 1):
+                    try:
+                        chart_shapes += int(ws.ChartObjects(ci).Chart.Shapes.Count)
+                    except Exception:
+                        pass
+
+                out_names.add(sheet_name)
+                restored.append(sheet_name)
+                print(
+                    f'  [{sheet_name}] 복원 완료 '
+                    f'(시트도형 {n_shapes}, 차트 {n_charts}, 차트내도형 {chart_shapes})'
+                )
+            except Exception as e:
+                print(f'  [{sheet_name}] 대시보드 복원 실패: {e}')
+
+        if restored:
+            if os.path.isfile(clean_path):
+                try:
+                    os.remove(clean_path)
+                except OSError:
+                    pass
+            # OneDrive 경로에 직접 SaveAs 하면 동기화/잠금으로 깨질 수 있어
+            # 로컬 temp에 저장한 뒤 최종 경로로 복사한다.
+            out_wb.SaveAs(clean_path, FileFormat=xl_openxml)
+            out_wb.Close(SaveChanges=False)
+            out_wb = None
+            mas_wb.Close(SaveChanges=False)
+            mas_wb = None
+            shutil.copy2(clean_path, output_path)
+    finally:
+        if out_wb is not None:
+            try:
+                out_wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if mas_wb is not None:
+            try:
+                mas_wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if os.path.isfile(clean_path):
+            try:
+                os.remove(clean_path)
+            except OSError:
+                pass
+        if own_excel:
+            excel_app.Quit()
+
+    return restored
+
+
 # ---------------------------------------------------------------------------
 # CLI · 하위 호환
 # ---------------------------------------------------------------------------
 
 
 def save_text_boxes_csv(text_boxes, csv_path):
-    fields = [
-        'chart_title', 'chart_name', 'name', 'text',
-        'top', 'left', 'width', 'height', 'source', 'chart_object',
-    ]
+    fields = ['chart_title', 'chart_name', 'name', 'text']
     with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         writer.writeheader()
