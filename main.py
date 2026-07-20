@@ -6,7 +6,7 @@ import re
 from openpyxl.styles import PatternFill
 import cProfile
 
-# utils.py에서 함수와 변수들을 가져옵니다. (!! 반드시 utils.py와 main.py는 같은 경로에 있어야 합니다 !!)
+# utils.py에서 함수와 변수들을 가져옵니다. (!! 반드시 utils.py, dashboard.py와 main.py는 같은 경로에 있어야 합니다 !!)
 from utils import (
     has_any_border, copy_border_deep, is_blue_cell, row_has_blue, get_real_cell,
     load_workbooks, load_dept_workbooks, build_merge_lookup, build_dept_sheet_cache,
@@ -320,7 +320,7 @@ def aggregate_text_sheets(master_wb, dept_wbooks, text_sheets):
             continue
 
         master_ws = master_wb[sheet_name]
-        print(f'[{sheet_name}] 텍스트 중심 서술형 시트 취합 및 강제 행 대체 공정을 개시합니다.')
+        print(f'[{sheet_name}] 텍스트 중심 서술형 시트 취합 시작.')
 
         max_row = master_ws.max_row
         max_col = master_ws.max_column
@@ -347,7 +347,7 @@ def aggregate_text_sheets(master_wb, dept_wbooks, text_sheets):
                         if not is_blue_cell(dept_cell_raw) and not is_blue_cell(d_eff):
                             continue
 
-                        print(f'  -> [파란색 셀 포착] {r}행 {c}열 / 해당 {r}행 전체를 통째로 이식합니다.')
+                        print(f'  -> [파란색 셀 포착] {r}행 {c}열 / 해당 {r}행 전체를 이식합니다.')
 
                         for copy_c in range(1, max_col + 1):
                             m_cell_raw = master_ws.cell(row=r, column=copy_c)
@@ -404,7 +404,7 @@ if __name__ == "__main__":
 
     print(f' 전월({prev_year_short}.{prev_month:02d}) 취합 대상 부서 파일 총 {len(dept_files)}개 발견.')
     if skipped_dept_files:
-        print(f'      (기준 외 타월 파일 {len(skipped_dept_files)}개 안전하게 스킵 제외 완료)')
+        print(f'      (기준 외 파일 {len(skipped_dept_files)}개 제외)')
 
     if not dept_files:
         print(" 취합 요건을 충족하는 부서별 파일이 없습니다.")
@@ -456,14 +456,23 @@ if __name__ == "__main__":
     output_file = os.path.join(folder_file, f"도시개발본부_현금흐름_최종취합_완성본({prev_year_short}.{prev_month:02d}).xlsx")
 
     # openpyxl이 DashBoard(차트/도형)를 저장하면 xlsx 도면 XML이 깨져
-    # Excel이 '내용을 복구하시겠습니까?'를 띄운다 → 저장 전에 대시보드 시트 제거
-    from dashboard import strip_dashboard_sheets, restore_dashboard_sheets_to_output
+    # Excel Open이 실패함 → 저장 전 시트 제거 + 저장 후 도면 잔여물 purge
+    from dashboard import (
+        strip_dashboard_sheets,
+        purge_xlsx_drawing_parts,
+        restore_dashboard_sheets_to_output,
+    )
     removed_dash = strip_dashboard_sheets(master_wb)
     if removed_dash:
         print(f" openpyxl 안전 저장을 위해 DashBoard 시트 임시 제외: {', '.join(removed_dash)}")
 
     master_wb.save(output_file)
     master_wb.close()
+    try:
+        purge_xlsx_drawing_parts(output_file)
+        print(" openpyxl 저장본 도면/차트 잔여 패키지 정리 완료")
+    except Exception as e:
+        print(f" 도면 잔여 패키지 정리 경고(복원에서 재시도): {e}")
     print(f" 최종 취합본 파일 저장완료 \n -> 경로: {output_file}")
 
     # 취합용 원본에서 DashBoard(도형·차트·텍스트)를 COM으로 붙임
