@@ -777,16 +777,29 @@ def _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names):
                     target.Delete()
                     break
             src = mas_wb.Worksheets(sheet_name)
-            # 주의: Copy()를 인자 없이 호출하면 그 시트 하나만 담은 '임시 통합문서'가
-            # 새로 생기고, 그 유일한 시트를 Move()로 꺼내면 임시 통합문서에 시트가
-            # 0개 남아 "통합 문서에는 시트가 하나 이상 표시되어야 합니다" 오류가 난다.
-            # After=를 지정해 out_wb로 바로 복사하면 임시 통합문서 자체가 생기지 않는다.
-            src.Copy(After=out_wb.Worksheets(out_wb.Worksheets.Count))
-            new_ws = out_wb.Worksheets(out_wb.Worksheets.Count)
+            # Excel은 '숨김(Hidden/VeryHidden)' 시트에 대해 .Copy()를 호출하면
+            # "Worksheet 클래스 중 Copy 메서드에 오류가 있습니다"로 실패한다.
+            # 취합용(mas_wb)은 어차피 저장하지 않으므로, 복사 직전에만 임시로
+            # 표시 상태로 바꿨다가 끝나면 원래 상태로 되돌린다.
+            orig_visible = src.Visible
+            if orig_visible != -1:  # -1 == xlSheetVisible
+                src.Visible = -1
+            try:
+                before_count = out_wb.Worksheets.Count
+                # 주의: Copy()를 인자 없이 호출하면 그 시트 하나만 담은 '임시 통합문서'가
+                # 새로 생기고, 그 유일한 시트를 Move()로 꺼내면 임시 통합문서에 시트가
+                # 0개 남아 "통합 문서에는 시트가 하나 이상 표시되어야 합니다" 오류가 난다.
+                # After=를 지정해 out_wb로 바로 복사하면 임시 통합문서 자체가 생기지 않는다.
+                src.Copy(After=out_wb.Worksheets(before_count))
+                # '마지막 시트'라고 다시 조회하지 않고, 복사 전 개수+1로 정확히 지목한다.
+                new_ws = out_wb.Worksheets(before_count + 1)
+            finally:
+                if orig_visible != -1:
+                    src.Visible = orig_visible
             if new_ws.Name != sheet_name:
                 new_ws.Name = sheet_name
 
-            ws = out_wb.Worksheets(sheet_name)
+            ws = new_ws
             n_shapes = int(ws.Shapes.Count)
             n_charts = int(ws.ChartObjects().Count)
             chart_shapes = 0
@@ -1069,3 +1082,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+
