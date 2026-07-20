@@ -1,3 +1,11 @@
+"""
+DashBoard 시트 — 차트 위 텍스트 상자 추출 · 전처리 · 부서 diff · 취합본 저장.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import os
 import re
 import sys
 from contextlib import contextmanager
@@ -584,7 +592,7 @@ def strip_dashboard_sheets(workbook) -> list[str]:
     openpyxl 워크북에서 DashBoard 시트를 제거한다.
 
     openpyxl이 차트/도형이 있는 시트를 저장하면 xl/drawings 관계가 깨져
-    Excel이 '내용을 복구하시겠습니까?'를 띄운다.
+    Excel이 '내용을 복구하시겠습니까?' / Open 오류를 낸다.
     저장 전에 대시보드 시트를 빼 두고, 저장 후 COM으로 취합용 원본을 붙인다.
     """
     removed = [
@@ -593,43 +601,126 @@ def strip_dashboard_sheets(workbook) -> list[str]:
     ]
     for name in removed:
         del workbook[name]
+    # 남은 시트에도 부분적으로 로드된 차트/이미지 참조가 있으면 제거
+    for ws in workbook.worksheets:
+        if hasattr(ws, '_charts'):
+            ws._charts = []
+        if hasattr(ws, '_images'):
+            ws._images = []
     return removed
 
 
-def _excel_open_workbook(excel_app, path, read_only=False):
+def purge_xlsx_drawing_parts(xlsx_path: str) -> None:
+    """
+    openpyxl 저장본 xlsx 안에서 깨진 도면/차트 패키지 조각을 제거한다.
+
+    DashBoard 시트를 지워도 xl/drawings·xl/charts·worksheet의 <drawing> 태그/
+    .rels 링크가 남아 있으면 Excel Workbooks.Open이
+    'Open 메서드에 오류가 있습니다'(-2146827284)로 실패한다.
+    """
+    import zipfile
+    from io import BytesIO
+
+    xlsx_path = os.path.abspath(xlsx_path)
+    buf = BytesIO()
+
+    def _clean_content_types(data: bytes) -> bytes:
+        text = data.decode('utf-8', errors='ignore')
+        text = re.sub(
+            r'<Override[^>]+(drawings/|charts/|chartsheets/)[^/]*/>',
+            '',
+            text,
+        )
+        return text.encode('utf-8')
+
+    def _clean_rels(data: bytes) -> bytes:
+        text = data.decode('utf-8', errors='ignore')
+        text = re.sub(
+            r'<Relationship[^>]+Type="[^"]*(drawing|chart|chartsheet)[^"]*"[^/]*/>',
+            '',
+            text,
+            flags=re.IGNORECASE,
+        )
+        return text.encode('utf-8')
+
+    def _clean_sheet_xml(data: bytes) -> bytes:
+        text = data.decode('utf-8', errors='ignore')
+        text = re.sub(r'<drawing[^>]*?/>', '', text)
+        text = re.sub(r'<drawing[^>]*>.*?</drawing>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<legacyDrawing[^>]*?/>', '', text)
+        text = re.sub(r'<legacyDrawingHF[^>]*?/>', '', text)
+        return text.encode('utf-8')
+
+    skip_prefixes = (
+        'xl/drawings/',
+        'xl/charts/',
+        'xl/chartsheets/',
+    )
+    with zipfile.ZipFile(xlsx_path, 'r') as zin, \
+            zipfile.ZipFile(buf, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            name = info.filename.replace('\\', '/')
+            if any(name.startswith(p) for p in skip_prefixes):
+                continue
+            data = zin.read(info.filename)
+            base = name.rsplit('/', 1)[-1]
+            if name == '[Content_Types].xml':
+                data = _clean_content_types(data)
+            elif name.endswith('.rels'):
+                data = _clean_rels(data)
+            elif name.startswith('xl/worksheets/') and base.endswith('.xml'):
+                data = _clean_sheet_xml(data)
+            # ZipInfo 재사용 시 암호/플래그 이슈 피하려면 새 이름으로 기록
+            zout.writestr(name, data)
+
+    with open(xlsx_path, 'wb') as f:
+        f.write(buf.getvalue())
+
+
+def _excel_open_workbook(excel_app, path, read_only=False, allow_repair=True):
     """
     Workbooks.Open 안전 호출.
 
-    DispatchEx(지연 바인딩)에서 keyword 인자(UpdateLinks=, ReadOnly= 등)를 쓰면
-    인자가 어긋나 'Open 메서드에 오류가 있습니다'(-2146827284)가 난다.
-    → 위치 인자만 사용: Open(Filename, UpdateLinks, ReadOnly)
-
-    경로에 ')' 등(예: 3)현금흐름)이 있으면 COM Open이 실패할 수 있어
-    로컬 temp 복사본으로 한 번 더 시도한다.
+    - DispatchEx에서는 keyword 인자 금지 → Open(path, UpdateLinks, ReadOnly) 위치 인자만
+    - 경로 특수문자 대비 temp 복사 재시도
+    - 그래도 실패하고 allow_repair면 도면 잔여물 purge 후 재시도
     """
     import shutil
     import tempfile
 
     path = os.path.abspath(path)
+
+    def _open(p):
+        # UpdateLinks=0, ReadOnly=bool
+        return excel_app.Workbooks.Open(p, 0, bool(read_only))
+
+    errors = []
     try:
-        # UpdateLinks=0, ReadOnly=bool  — keyword 금지
-        return excel_app.Workbooks.Open(path, 0, bool(read_only))
-    except Exception as first_err:
-        safe_name = re.sub(r'[^\w.\-]+', '_', os.path.basename(path))
-        tmp = os.path.join(
-            tempfile.gettempdir(),
-            f'cashflow_open_{os.getpid()}_{safe_name}',
-        )
+        return _open(path)
+    except Exception as e:
+        errors.append(f'직접 열기: {e}')
+
+    safe_name = re.sub(r'[^\w.\-]+', '_', os.path.basename(path))
+    tmp = os.path.join(tempfile.gettempdir(), f'cashflow_open_{os.getpid()}_{safe_name}')
+    try:
+        shutil.copy2(path, tmp)
+        return _open(tmp)
+    except Exception as e:
+        errors.append(f'temp 복사 열기: {e}')
+
+    if allow_repair and not read_only:
         try:
+            print('  openpyxl 저장본 도면/차트 잔여물 제거 후 재시도...')
+            purge_xlsx_drawing_parts(path)
             shutil.copy2(path, tmp)
-            return excel_app.Workbooks.Open(tmp, 0, bool(read_only))
-        except Exception as second_err:
-            raise RuntimeError(
-                f'Excel Workbooks.Open 실패\n'
-                f'  경로: {path}\n'
-                f'  직접 열기: {first_err}\n'
-                f'  temp 복사 열기: {second_err}'
-            ) from second_err
+            return _open(tmp)
+        except Exception as e:
+            errors.append(f'purge 후 열기: {e}')
+
+    raise RuntimeError(
+        'Excel Workbooks.Open 실패\n'
+        f'  경로: {path}\n  ' + '\n  '.join(errors)
+    )
 
 
 def restore_dashboard_sheets_to_output(master_path, output_path, sheet_names=None, excel_app=None):
@@ -675,10 +766,22 @@ def restore_dashboard_sheets_to_output(master_path, output_path, sheet_names=Non
         f'cashflow_dashboard_restore_{os.getpid()}.xlsx',
     )
     try:
-        print(f'  최종파일 Open: {output_path}')
-        out_wb = _excel_open_workbook(excel_app, output_path, read_only=False)
+        # 취합용(원본)부터 열어 Excel COM 자체가 동작하는지 확인
         print(f'  취합용 Open: {master_path}')
-        mas_wb = _excel_open_workbook(excel_app, master_path, read_only=True)
+        mas_wb = _excel_open_workbook(
+            excel_app, master_path, read_only=True, allow_repair=False,
+        )
+
+        # openpyxl 저장본은 도면 잔여물이 있을 수 있어 Open 전에 purge
+        try:
+            purge_xlsx_drawing_parts(output_path)
+        except Exception as e:
+            print(f'  최종파일 purge 경고: {e}')
+
+        print(f'  최종파일 Open: {output_path}')
+        out_wb = _excel_open_workbook(
+            excel_app, output_path, read_only=False, allow_repair=True,
+        )
 
         out_names = {out_wb.Worksheets(i).Name for i in range(1, out_wb.Worksheets.Count + 1)}
         mas_names = {
@@ -846,3 +949,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+
