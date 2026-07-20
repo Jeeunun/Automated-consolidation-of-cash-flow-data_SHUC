@@ -791,15 +791,33 @@ def _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names):
                 before_names = {
                     out_wb.Worksheets(j).Name for j in range(1, out_wb.Worksheets.Count + 1)
                 }
-                # 주의: Copy()를 인자 없이 호출하면 그 시트 하나만 담은 '임시 통합문서'가
-                # 새로 생기고, 그 유일한 시트를 Move()로 꺼내면 임시 통합문서에 시트가
-                # 0개 남아 "통합 문서에는 시트가 하나 이상 표시되어야 합니다" 오류가 난다.
-                # After=를 지정해 out_wb로 바로 복사하면 임시 통합문서 자체가 생기지 않는다.
-                src.Copy(After=out_wb.Worksheets(out_wb.Worksheets.Count))
+                # 1차 시도: Copy(Before, After) 위치 인자로 out_wb에 직접 복사.
+                # (Copy(After=...) 같은 '이름있는 인자'는 win32com 동적 디스패치에서
+                #  무시되고 조용히 새 통합문서가 생겨버리는 경우가 있어 위치 인자를 쓴다.)
+                anchor = out_wb.Worksheets(out_wb.Worksheets.Count)
+                src.Copy(None, anchor)
                 after_names = {
                     out_wb.Worksheets(j).Name for j in range(1, out_wb.Worksheets.Count + 1)
                 }
                 added_names = after_names - before_names
+
+                if len(added_names) != 1:
+                    # 2차 시도(폴백): 인자 없이 복사 → 임시 통합문서 생성.
+                    # 이 임시 통합문서의 시트를 Move가 아니라 다시 Copy로 out_wb에 옮긴다.
+                    # Move는 원본(임시 통합문서)에 시트가 0개 남아 오류가 나지만,
+                    # Copy는 원본을 비우지 않으므로 안전하다.
+                    print(f'  [{sheet_name}] 1차 복사 방식 실패 → 대안(임시 통합문서 경유) 시도')
+                    src.Copy()
+                    temp_wb = excel_app.ActiveWorkbook
+                    try:
+                        temp_ws = temp_wb.Worksheets(1)
+                        temp_ws.Copy(None, out_wb.Worksheets(out_wb.Worksheets.Count))
+                    finally:
+                        temp_wb.Close(SaveChanges=False)
+                    after_names = {
+                        out_wb.Worksheets(j).Name for j in range(1, out_wb.Worksheets.Count + 1)
+                    }
+                    added_names = after_names - before_names
                 if len(added_names) != 1:
                     raise RuntimeError(
                         f'복사 후 새로 추가된 시트를 특정할 수 없습니다 '
