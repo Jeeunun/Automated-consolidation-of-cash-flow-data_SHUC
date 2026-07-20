@@ -679,43 +679,43 @@ def purge_xlsx_drawing_parts(xlsx_path: str) -> None:
 
 def _excel_open_workbook(excel_app, path, read_only=False, allow_repair=True):
     """
-    Workbooks.Open 안전 호출.
-
-    - DispatchEx에서는 keyword 인자 금지 → Open(path, UpdateLinks, ReadOnly) 위치 인자만
-    - 경로 특수문자 대비 temp 복사 재시도
-    - 그래도 실패하고 allow_repair면 도면 잔여물 purge 후 재시도
+    Workbooks.Open 안전 호출 (위치 인자만).
+    allow_repair=True 이면 CorruptLoad(복구 모드)까지 시도.
     """
     import shutil
     import tempfile
 
     path = os.path.abspath(path)
 
-    def _open(p):
-        # UpdateLinks=0, ReadOnly=bool
+    def _open(p, corrupt_load=0):
+        # Open(Filename, UpdateLinks, ReadOnly, Format, Password, WriteResPassword,
+        #      IgnoreReadOnlyRecommended, Origin, Delimiter, Editable, Notify,
+        #      Converter, AddToMru, Local, CorruptLoad)
+        if corrupt_load:
+            return excel_app.Workbooks.Open(
+                p, 0, bool(read_only),
+                None, None, None, True,
+                None, None, None, None, None, None, False,
+                int(corrupt_load),
+            )
         return excel_app.Workbooks.Open(p, 0, bool(read_only))
 
     errors = []
-    try:
-        return _open(path)
-    except Exception as e:
-        errors.append(f'직접 열기: {e}')
-
-    safe_name = re.sub(r'[^\w.\-]+', '_', os.path.basename(path))
-    tmp = os.path.join(tempfile.gettempdir(), f'cashflow_open_{os.getpid()}_{safe_name}')
-    try:
-        shutil.copy2(path, tmp)
-        return _open(tmp)
-    except Exception as e:
-        errors.append(f'temp 복사 열기: {e}')
-
-    if allow_repair and not read_only:
+    for corrupt_load in (0, 1) if allow_repair else (0,):
         try:
-            print('  openpyxl 저장본 도면/차트 잔여물 제거 후 재시도...')
-            purge_xlsx_drawing_parts(path)
-            shutil.copy2(path, tmp)
-            return _open(tmp)
+            return _open(path, corrupt_load)
         except Exception as e:
-            errors.append(f'purge 후 열기: {e}')
+            tag = '직접 열기' if corrupt_load == 0 else 'CorruptLoad 열기'
+            errors.append(f'{tag}: {e}')
+
+        safe_name = re.sub(r'[^\w.\-]+', '_', os.path.basename(path))
+        tmp = os.path.join(tempfile.gettempdir(), f'cashflow_open_{os.getpid()}_{safe_name}')
+        try:
+            shutil.copy2(path, tmp)
+            return _open(tmp, corrupt_load)
+        except Exception as e:
+            tag = 'temp 복사 열기' if corrupt_load == 0 else 'temp+CorruptLoad 열기'
+            errors.append(f'{tag}: {e}')
 
     raise RuntimeError(
         'Excel Workbooks.Open 실패\n'
@@ -723,19 +723,169 @@ def _excel_open_workbook(excel_app, path, read_only=False, allow_repair=True):
     )
 
 
+def _com_dump_openpyxl_sheet(py_ws, com_ws, chunk_rows=250):
+    """openpyxl 시트 값(+병합)을 COM 시트로 고속 배열 기록."""
+    max_r = py_ws.max_row or 0
+    max_c = py_ws.max_column or 0
+    if max_r < 1 or max_c < 1:
+        return
+    for r0 in range(1, max_r + 1, chunk_rows):
+        r1 = min(r0 + chunk_rows - 1, max_r)
+        block = []
+        for r in range(r0, r1 + 1):
+            block.append(tuple(py_ws.cell(r, c).value for c in range(1, max_c + 1)))
+        com_ws.Range(com_ws.Cells(r0, 1), com_ws.Cells(r1, max_c)).Value = tuple(block)
+    for merged in py_ws.merged_cells.ranges:
+        try:
+            com_ws.Range(str(merged)).Merge()
+        except Exception:
+            pass
+
+
+def _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names):
+    """취합용 mas_wb의 DashBoard 시트를 out_wb 맨 뒤에 붙인다."""
+    restored = []
+    mas_names = {
+        mas_wb.Worksheets(i).Name for i in range(1, mas_wb.Worksheets.Count + 1)
+    }
+    for sheet_name in sheet_names:
+        if sheet_name not in mas_names:
+            print(f'  [{sheet_name}] 취합용에 시트가 없어 복원 스킵.')
+            continue
+        try:
+            # 이미 있으면 제거 후 교체
+            for i in range(out_wb.Worksheets.Count, 0, -1):
+                if out_wb.Worksheets(i).Name == sheet_name:
+                    out_wb.Worksheets(i).Delete()
+                    break
+            src = mas_wb.Worksheets(sheet_name)
+            src.Copy()
+            temp_sheet = excel_app.ActiveWorkbook.Worksheets(1)
+            temp_sheet.Move(After=out_wb.Worksheets(out_wb.Worksheets.Count))
+            if out_wb.ActiveSheet.Name != sheet_name:
+                out_wb.ActiveSheet.Name = sheet_name
+
+            ws = out_wb.Worksheets(sheet_name)
+            n_shapes = int(ws.Shapes.Count)
+            n_charts = int(ws.ChartObjects().Count)
+            chart_shapes = 0
+            for ci in range(1, n_charts + 1):
+                try:
+                    chart_shapes += int(ws.ChartObjects(ci).Chart.Shapes.Count)
+                except Exception:
+                    pass
+            restored.append(sheet_name)
+            print(
+                f'  [{sheet_name}] 복원 완료 '
+                f'(시트도형 {n_shapes}, 차트 {n_charts}, 차트내도형 {chart_shapes})'
+            )
+        except Exception as e:
+            print(f'  [{sheet_name}] 대시보드 복원 실패: {e}')
+    return restored
+
+
+def _rebuild_output_with_dashboards_via_com(excel_app, master_path, output_path, sheet_names):
+    """
+    Excel이 openpyxl 저장본을 Open하지 못할 때 사용하는 우회 경로.
+
+    - 취합 데이터: openpyxl로 읽음 (Excel Open 불필요)
+    - 새 Excel 통합문서에 값 배열로 기록
+    - DashBoard: 취합용(master)에서 Copy/Move
+    - 로컬 temp SaveAs 후 최종 경로로 복사
+    """
+    import shutil
+    import tempfile
+    from openpyxl import load_workbook
+
+    print('  [우회] Excel이 최종파일을 열 수 없어 재조립합니다...')
+    print('         (취합 데이터=openpyxl 읽기, DashBoard=취합용 COM 복사)')
+
+    data_wb = load_workbook(output_path, data_only=False, keep_links=False)
+    mas_wb = None
+    out_wb = None
+    xl_openxml = 51
+    clean_path = os.path.join(
+        tempfile.gettempdir(),
+        f'cashflow_rebuild_{os.getpid()}.xlsx',
+    )
+    try:
+        mas_wb = _excel_open_workbook(
+            excel_app, master_path, read_only=True, allow_repair=False,
+        )
+        if sheet_names is None:
+            sheet_names = [
+                mas_wb.Worksheets(i).Name
+                for i in range(1, mas_wb.Worksheets.Count + 1)
+                if mas_wb.Worksheets(i).Name.startswith(DASHBOARD_SHEET_PREFIXES)
+            ]
+
+        excel_app.DisplayAlerts = False
+        out_wb = excel_app.Workbooks.Add()
+        while out_wb.Worksheets.Count > 1:
+            out_wb.Worksheets(out_wb.Worksheets.Count).Delete()
+
+        first = True
+        for sheet_name in data_wb.sheetnames:
+            print(f'  [우회] 데이터 시트 기록: {sheet_name}')
+            if first:
+                com_ws = out_wb.Worksheets(1)
+                com_ws.Name = sheet_name[:31]
+                first = False
+            else:
+                # Add(After=)는 DispatchEx에서 실패할 수 있어 Add 후 Move 사용
+                last = out_wb.Worksheets(out_wb.Worksheets.Count)
+                com_ws = out_wb.Worksheets.Add()
+                com_ws.Move(After=last)
+                com_ws.Name = sheet_name[:31]
+            _com_dump_openpyxl_sheet(data_wb[sheet_name], com_ws)
+
+        data_wb.close()
+        data_wb = None
+
+        restored = _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names)
+
+        if os.path.isfile(clean_path):
+            try:
+                os.remove(clean_path)
+            except OSError:
+                pass
+        out_wb.SaveAs(clean_path, FileFormat=xl_openxml)
+        out_wb.Close(SaveChanges=False)
+        out_wb = None
+        mas_wb.Close(SaveChanges=False)
+        mas_wb = None
+        shutil.copy2(clean_path, output_path)
+        return restored
+    finally:
+        if data_wb is not None:
+            try:
+                data_wb.close()
+            except Exception:
+                pass
+        if out_wb is not None:
+            try:
+                out_wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if mas_wb is not None:
+            try:
+                mas_wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if os.path.isfile(clean_path):
+            try:
+                os.remove(clean_path)
+            except OSError:
+                pass
+
+
 def restore_dashboard_sheets_to_output(master_path, output_path, sheet_names=None, excel_app=None):
     """
     취합용(master) DashBoard 시트를 최종 취합본(output)에 붙인다.
 
-    전제: output은 openpyxl 저장 전에 DashBoard가 제거된 '깨끗한' 파일이어야
-    Excel 복구 프롬프트가 뜨지 않는다.
-
-    절차:
-      (1) output에 남아 있는 동명 DashBoard가 있으면 삭제
-      (2) master 시트를 Copy() → Move로 output에 삽입
-      (3) 로컬 temp에 SaveAs 후 최종 경로로 복사 (OneDrive 잠금/동기화 회피)
-
-    Returns: 복원된 시트명 리스트.
+    1순위: Excel이 output을 Open할 수 있으면 그 책에 DashBoard만 붙임
+    2순위: Open 실패 시 → openpyxl로 데이터 읽고 새 통합문서 재조립 + DashBoard 복사
+           (취합용은 Open 되고, openpyxl 저장본만 Open 안 되는 경우 대응)
     """
     import shutil
     import tempfile
@@ -760,96 +910,47 @@ def restore_dashboard_sheets_to_output(master_path, output_path, sheet_names=Non
     restored = []
     out_wb = None
     mas_wb = None
-    xl_openxml = 51  # xlOpenXMLWorkbook
+    xl_openxml = 51
     clean_path = os.path.join(
         tempfile.gettempdir(),
         f'cashflow_dashboard_restore_{os.getpid()}.xlsx',
     )
     try:
-        # 취합용(원본)부터 열어 Excel COM 자체가 동작하는지 확인
         print(f'  취합용 Open: {master_path}')
         mas_wb = _excel_open_workbook(
             excel_app, master_path, read_only=True, allow_repair=False,
         )
-
-        # openpyxl 저장본은 도면 잔여물이 있을 수 있어 Open 전에 purge
-        try:
-            purge_xlsx_drawing_parts(output_path)
-        except Exception as e:
-            print(f'  최종파일 purge 경고: {e}')
-
-        print(f'  최종파일 Open: {output_path}')
-        out_wb = _excel_open_workbook(
-            excel_app, output_path, read_only=False, allow_repair=True,
-        )
-
-        out_names = {out_wb.Worksheets(i).Name for i in range(1, out_wb.Worksheets.Count + 1)}
-        mas_names = {
-            mas_wb.Worksheets(i).Name
-            for i in range(1, mas_wb.Worksheets.Count + 1)
-        }
         if sheet_names is None:
-            # 취합용 시트 순서 유지
             sheet_names = [
                 mas_wb.Worksheets(i).Name
                 for i in range(1, mas_wb.Worksheets.Count + 1)
                 if mas_wb.Worksheets(i).Name.startswith(DASHBOARD_SHEET_PREFIXES)
             ]
 
-        excel_app.DisplayAlerts = False
-        for sheet_name in sheet_names:
-            if sheet_name not in mas_names:
-                print(f'  [{sheet_name}] 취합용에 시트가 없어 복원 스킵.')
-                continue
+        # 1순위: 최종파일 Open 시도
+        try:
             try:
-                insert_after = None
-                if sheet_name in out_names:
-                    old = out_wb.Worksheets(sheet_name)
-                    idx = int(old.Index)
-                    if idx > 1:
-                        insert_after = out_wb.Worksheets(idx - 1)
-                    old.Delete()
-                    out_names.discard(sheet_name)
-
-                if out_wb.Worksheets.Count < 1:
-                    out_wb.Worksheets.Add()
-
-                # master → 임시 통합문서(Copy 무인자) → output으로 Move
-                src = mas_wb.Worksheets(sheet_name)
-                src.Copy()
-                temp_sheet = excel_app.ActiveWorkbook.Worksheets(1)
-                if insert_after is not None:
-                    temp_sheet.Move(After=insert_after)
-                else:
-                    # openpyxl 저장 전 제거된 경우 → 맨 뒤에 추가
-                    temp_sheet.Move(After=out_wb.Worksheets(out_wb.Worksheets.Count))
-
-                current_names = {
-                    out_wb.Worksheets(i).Name
-                    for i in range(1, out_wb.Worksheets.Count + 1)
-                }
-                if sheet_name not in current_names:
-                    out_wb.ActiveSheet.Name = sheet_name
-
-                # 도형 복원 여부 확인
-                ws = out_wb.Worksheets(sheet_name)
-                n_shapes = int(ws.Shapes.Count)
-                n_charts = int(ws.ChartObjects().Count)
-                chart_shapes = 0
-                for ci in range(1, n_charts + 1):
-                    try:
-                        chart_shapes += int(ws.ChartObjects(ci).Chart.Shapes.Count)
-                    except Exception:
-                        pass
-
-                out_names.add(sheet_name)
-                restored.append(sheet_name)
-                print(
-                    f'  [{sheet_name}] 복원 완료 '
-                    f'(시트도형 {n_shapes}, 차트 {n_charts}, 차트내도형 {chart_shapes})'
-                )
+                purge_xlsx_drawing_parts(output_path)
             except Exception as e:
-                print(f'  [{sheet_name}] 대시보드 복원 실패: {e}')
+                print(f'  최종파일 purge 경고: {e}')
+            print(f'  최종파일 Open: {output_path}')
+            out_wb = _excel_open_workbook(
+                excel_app, output_path, read_only=False, allow_repair=True,
+            )
+        except Exception as open_err:
+            print(f'  최종파일 Open 실패 → 우회 재조립 사용\n    ({open_err})')
+            # master는 이미 열려 있으므로 닫고 우회 함수에서 다시 연다
+            try:
+                mas_wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+            mas_wb = None
+            return _rebuild_output_with_dashboards_via_com(
+                excel_app, master_path, output_path, sheet_names,
+            )
+
+        excel_app.DisplayAlerts = False
+        restored = _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names)
 
         if restored:
             if os.path.isfile(clean_path):
@@ -857,8 +958,6 @@ def restore_dashboard_sheets_to_output(master_path, output_path, sheet_names=Non
                     os.remove(clean_path)
                 except OSError:
                     pass
-            # OneDrive 경로에 직접 SaveAs 하면 동기화/잠금으로 깨질 수 있어
-            # 로컬 temp에 저장한 뒤 최종 경로로 복사한다.
             out_wb.SaveAs(clean_path, FileFormat=xl_openxml)
             out_wb.Close(SaveChanges=False)
             out_wb = None
