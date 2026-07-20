@@ -777,11 +777,14 @@ def _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names):
                     target.Delete()
                     break
             src = mas_wb.Worksheets(sheet_name)
-            src.Copy()
-            temp_sheet = excel_app.ActiveWorkbook.Worksheets(1)
-            temp_sheet.Move(After=out_wb.Worksheets(out_wb.Worksheets.Count))
-            if out_wb.ActiveSheet.Name != sheet_name:
-                out_wb.ActiveSheet.Name = sheet_name
+            # 주의: Copy()를 인자 없이 호출하면 그 시트 하나만 담은 '임시 통합문서'가
+            # 새로 생기고, 그 유일한 시트를 Move()로 꺼내면 임시 통합문서에 시트가
+            # 0개 남아 "통합 문서에는 시트가 하나 이상 표시되어야 합니다" 오류가 난다.
+            # After=를 지정해 out_wb로 바로 복사하면 임시 통합문서 자체가 생기지 않는다.
+            src.Copy(After=out_wb.Worksheets(out_wb.Worksheets.Count))
+            new_ws = out_wb.Worksheets(out_wb.Worksheets.Count)
+            if new_ws.Name != sheet_name:
+                new_ws.Name = sheet_name
 
             ws = out_wb.Worksheets(sheet_name)
             n_shapes = int(ws.Shapes.Count)
@@ -1066,4 +1069,3 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
-
