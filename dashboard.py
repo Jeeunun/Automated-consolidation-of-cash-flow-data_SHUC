@@ -785,14 +785,28 @@ def _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names):
             if orig_visible != -1:  # -1 == xlSheetVisible
                 src.Visible = -1
             try:
-                before_count = out_wb.Worksheets.Count
+                # '개수+1 = 새 시트' 같은 인덱스 가정은 위치가 어긋나면 잘못된 인덱스
+                # 접근(Invalid index) 오류로 이어질 수 있어, 복사 전/후 시트 '이름 집합'을
+                # 비교해 새로 추가된 시트를 정확히 찾는다.
+                before_names = {
+                    out_wb.Worksheets(j).Name for j in range(1, out_wb.Worksheets.Count + 1)
+                }
                 # 주의: Copy()를 인자 없이 호출하면 그 시트 하나만 담은 '임시 통합문서'가
                 # 새로 생기고, 그 유일한 시트를 Move()로 꺼내면 임시 통합문서에 시트가
                 # 0개 남아 "통합 문서에는 시트가 하나 이상 표시되어야 합니다" 오류가 난다.
                 # After=를 지정해 out_wb로 바로 복사하면 임시 통합문서 자체가 생기지 않는다.
-                src.Copy(After=out_wb.Worksheets(before_count))
-                # '마지막 시트'라고 다시 조회하지 않고, 복사 전 개수+1로 정확히 지목한다.
-                new_ws = out_wb.Worksheets(before_count + 1)
+                src.Copy(After=out_wb.Worksheets(out_wb.Worksheets.Count))
+                after_names = {
+                    out_wb.Worksheets(j).Name for j in range(1, out_wb.Worksheets.Count + 1)
+                }
+                added_names = after_names - before_names
+                if len(added_names) != 1:
+                    raise RuntimeError(
+                        f'복사 후 새로 추가된 시트를 특정할 수 없습니다 '
+                        f'(복사 전 {len(before_names)}개 → 복사 후 {len(after_names)}개, '
+                        f'추가분: {sorted(added_names)})'
+                    )
+                new_ws = out_wb.Worksheets(next(iter(added_names)))
             finally:
                 if orig_visible != -1:
                     src.Visible = orig_visible
@@ -814,7 +828,9 @@ def _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names):
                 f'(시트도형 {n_shapes}, 차트 {n_charts}, 차트내도형 {chart_shapes})'
             )
         except Exception as e:
+            import traceback
             print(f'  [{sheet_name}] 대시보드 복원 실패: {e}')
+            traceback.print_exc()
     return restored
 
 
@@ -1082,4 +1098,5 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+
 
