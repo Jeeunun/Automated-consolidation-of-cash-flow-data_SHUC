@@ -756,7 +756,25 @@ def _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names):
             # 이미 있으면 제거 후 교체
             for i in range(out_wb.Worksheets.Count, 0, -1):
                 if out_wb.Worksheets(i).Name == sheet_name:
-                    out_wb.Worksheets(i).Delete()
+                    target = out_wb.Worksheets(i)
+                    # Excel은 통합문서에 '표시(Visible)' 상태 시트가 0개가 되는 걸 허용하지 않는다.
+                    # (예: 나머지 시트가 전부 숨김이고 이 시트만 표시 상태인 경우 Delete()가 -2146827284로 실패)
+                    # 삭제 대상이 마지막 표시 시트라면, 다른 시트를 하나 임시로 표시시켜 제약을 피한다.
+                    visible_count = sum(
+                        1 for j in range(1, out_wb.Worksheets.Count + 1)
+                        if out_wb.Worksheets(j).Visible == -1  # xlSheetVisible
+                    )
+                    if visible_count <= 1 and target.Visible == -1:
+                        for j in range(1, out_wb.Worksheets.Count + 1):
+                            other = out_wb.Worksheets(j)
+                            if other.Name != sheet_name:
+                                other.Visible = -1
+                                print(
+                                    f'  [{sheet_name}] 삭제 전 임시로 [{other.Name}] 시트를 표시 처리 '
+                                    f'(표시 시트 0개 방지)'
+                                )
+                                break
+                    target.Delete()
                     break
             src = mas_wb.Worksheets(sheet_name)
             src.Copy()
