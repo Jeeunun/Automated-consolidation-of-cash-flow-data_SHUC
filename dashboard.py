@@ -596,6 +596,42 @@ def strip_dashboard_sheets(workbook) -> list[str]:
     return removed
 
 
+def _excel_open_workbook(excel_app, path, read_only=False):
+    """
+    Workbooks.Open 안전 호출.
+
+    DispatchEx(지연 바인딩)에서 keyword 인자(UpdateLinks=, ReadOnly= 등)를 쓰면
+    인자가 어긋나 'Open 메서드에 오류가 있습니다'(-2146827284)가 난다.
+    → 위치 인자만 사용: Open(Filename, UpdateLinks, ReadOnly)
+
+    경로에 ')' 등(예: 3)현금흐름)이 있으면 COM Open이 실패할 수 있어
+    로컬 temp 복사본으로 한 번 더 시도한다.
+    """
+    import shutil
+    import tempfile
+
+    path = os.path.abspath(path)
+    try:
+        # UpdateLinks=0, ReadOnly=bool  — keyword 금지
+        return excel_app.Workbooks.Open(path, 0, bool(read_only))
+    except Exception as first_err:
+        safe_name = re.sub(r'[^\w.\-]+', '_', os.path.basename(path))
+        tmp = os.path.join(
+            tempfile.gettempdir(),
+            f'cashflow_open_{os.getpid()}_{safe_name}',
+        )
+        try:
+            shutil.copy2(path, tmp)
+            return excel_app.Workbooks.Open(tmp, 0, bool(read_only))
+        except Exception as second_err:
+            raise RuntimeError(
+                f'Excel Workbooks.Open 실패\n'
+                f'  경로: {path}\n'
+                f'  직접 열기: {first_err}\n'
+                f'  temp 복사 열기: {second_err}'
+            ) from second_err
+
+
 def restore_dashboard_sheets_to_output(master_path, output_path, sheet_names=None, excel_app=None):
     """
     취합용(master) DashBoard 시트를 최종 취합본(output)에 붙인다.
@@ -625,7 +661,6 @@ def restore_dashboard_sheets_to_output(master_path, output_path, sheet_names=Non
         excel_app.Visible = False
         excel_app.DisplayAlerts = False
         try:
-            # 자동 복구 UI/알림 억제
             excel_app.AskToUpdateLinks = False
             excel_app.AlertBeforeOverwriting = False
         except Exception:
@@ -640,13 +675,10 @@ def restore_dashboard_sheets_to_output(master_path, output_path, sheet_names=Non
         f'cashflow_dashboard_restore_{os.getpid()}.xlsx',
     )
     try:
-        # UpdateLinks=0: 링크 갱신 안 함 / ReadOnly=False
-        out_wb = excel_app.Workbooks.Open(
-            output_path, UpdateLinks=0, ReadOnly=False, IgnoreReadOnlyRecommended=True,
-        )
-        mas_wb = excel_app.Workbooks.Open(
-            master_path, UpdateLinks=0, ReadOnly=True, IgnoreReadOnlyRecommended=True,
-        )
+        print(f'  최종파일 Open: {output_path}')
+        out_wb = _excel_open_workbook(excel_app, output_path, read_only=False)
+        print(f'  취합용 Open: {master_path}')
+        mas_wb = _excel_open_workbook(excel_app, master_path, read_only=True)
 
         out_names = {out_wb.Worksheets(i).Name for i in range(1, out_wb.Worksheets.Count + 1)}
         mas_names = {
