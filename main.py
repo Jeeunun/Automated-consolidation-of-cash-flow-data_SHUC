@@ -1,951 +1,489 @@
-"""
-DashBoard 시트 — 차트 위 텍스트 상자 추출 · 전처리 · 부서 diff · 취합본 저장.
-"""
-from __future__ import annotations
-
-import argparse
-import csv
 import os
+import openpyxl
+import glob
+import time
 import re
-import sys
-from contextlib import contextmanager
+from openpyxl.styles import PatternFill
+import cProfile
 
-import pandas as pd
-import win32com.client as win32
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
-from openpyxl.utils import get_column_letter
-from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
-# ---------------------------------------------------------------------------
-# 설정
-# ---------------------------------------------------------------------------
+# utils.py에서 함수와 변수들을 가져옵니다. (!! 반드시 utils.py, dashboard.py와 main.py는 같은 경로에 있어야 합니다 !!)
+from utils import (
+    has_any_border, copy_border_deep, is_blue_cell, row_has_blue, get_real_cell,
+    load_workbooks, load_dept_workbooks, build_merge_lookup, build_dept_sheet_cache,
+    shift_index_map_rows, shift_inserted_rows_set, shift_merged_cells_after_insert,
+    build_index_store, index_store_as_map,
+    map_execute_row_inserts, map_sync_prefix_alignment, map_restore_after_structural,
+    dept_apply_blue_cell_updates,     dept_apply_remap_and_new_rows, dept_sync_all_index_rows,
+    dept_mark_deleted_indexes, excel_layout_restore_after_inserts, fix_formulas_after_inserts,
+    build_prefix_first_rows, copy_cell_style_safe,
+    is_layout_col, should_capture_layout_cell,
+    capture_cell_style, apply_cell_style, safe_unmerge_cells, get_valid_prefixes,
+    extract_prefix, get_prefix_i_label, is_i_label_value, apply_i_section_label,
+    is_allowed_index_prefix,
+    get_section_header_rows, find_section_content_end_row,
+    get_section_end_row, get_sheet_index_map,
+    find_duplicate_index_rows, validate_new_index,
+    build_dept_index_fixup, fix_plan_virtual_indexes,
+    detect_renumber_cascade_candidates, should_skip_dept_new_index_add,
+    get_suggested_new_index,
+    extract_section_layout_templates,
+    apply_row_style_from_neighbor,
+    TARGET_BLUE_CODES, COLOR_ADD, COLOR_DELETE, INDEX_COL, NAME_COL, 
+    STYLE_SNAPSHOT_MAX_COL, numeric_sheets, text_sheets,
+    master_file, target_folder, base_path, prev_year_short, prev_month, dept_file_matches_prev_month
+)
 
-DASHBOARD_SHEET_PREFIXES = ('DashBoard', 'Dashboard')
-UNIT_LABEL = '(단위 : 백만원)'
-# '(단위 : 백만원)', '(단위:백만원)' 등 표기 변형
-UNIT_LABEL_RE = re.compile(r'단위\s*[:：]?\s*백만')
-STATUS_EXISTING = '기존'
-STATUS_DEPT_ADD = '부서추가'
-FILL_DEPT_ADD = PatternFill(start_color='FF6666', end_color='FF6666', fill_type='solid')
-HEADER_FONT = Font(bold=True)
+def _load_master_values_workbook():
+    '''L열~ 수식의 계산값 스냅샷용 (data_only).'''
+    if os.path.exists(master_file):
+        return openpyxl.load_workbook(
+            master_file, data_only=True, keep_links=False,
+        )
+    return None
 
-OUTPUT_COLUMNS = [
-    'status', 'source_file', 'chart_title', 'chart_name', 'text',
-]
-
-# 차트 위 섹션 제목 상자 식별용 (예: "□ 운영자본금", "ㅁ 사업준비금")
-SECTION_HEADER_MARKERS = '□■▢▣◻◼◽◾▪▫●○◎◇◆❑❒ㅁ※·-'
-# 섹션 제목은 날짜·금액 숫자가 없는 짧은 텍스트 (주석은 숫자 포함)
-SECTION_TITLE_MAX_LEN = 30
-# 대시보드 큰 섹션명 (셀/도형에서 우선 매칭)
-SECTION_NAME_KEYWORDS = ('운영자본금', '사업준비금', '부채')
-
-# ---------------------------------------------------------------------------
-# pywin32 — 텍스트 상자 추출
-# ---------------------------------------------------------------------------
-
-
-def _shape_text(shape) -> str:
-    for attr in ('TextFrame2', 'TextFrame'):
-        frame = getattr(shape, attr, None)
-        if frame is None:
-            continue
-        try:
-            if hasattr(frame, 'HasText') and not frame.HasText:
-                continue
-            text = frame.TextRange.Text
-            if text:
-                return text.replace('\r\n', '\n').replace('\r', '\n').strip()
-        except Exception:
-            continue
-    return ''
-
-
-def _iter_shapes(container):
-    try:
-        count = container.Shapes.Count
-    except Exception:
-        return
-    for i in range(1, count + 1):
-        yield container.Shapes(i)
-
-
-def _chart_title(chart_obj) -> str:
-    try:
-        chart = chart_obj.Chart
-        if chart.HasTitle:
-            return str(chart.ChartTitle.Text or '').strip()
-    except Exception:
-        pass
-    return chart_obj.Name
-
-
-def _is_unit_label(text: str) -> bool:
-    """단위 표기('(단위 : 백만원)' 등) 여부."""
-    return bool(UNIT_LABEL_RE.search(str(text or '')))
-
-
-def _cell_section_title_above_chart(ws, chart_obj) -> str:
+# ------------------------------------
+# [숫자 시트 취합]
+def aggregate_numeric_sheets(master_wb, dept_wbs, numeric_sheets):
     """
-    차트 바로 위 셀에서 섹션명(□ 운영자본금 등)을 읽음.
-    대시보드 섹션 제목이 도형이 아니라 셀에 있는 경우가 많음.
+    [함수 설명] 부서별 파일에서 숫자 시트들을 취합용 파일로 가져와 취합합니다.
+
+    [3층 아키텍처]
+      PLAN       — 부서 스캔: 신규/재번호/수정·삭제 후보 수집
+      MAP        — IndexStore: insert·행번호 갱신·밀린 L열~ baseline 복원
+      DEPT DIFF  — 파란셀·remap·신규행 데이터·layout 후 전체 인덱스 동기화
+      EXCEL LAYOUT — I~L 병합/서식·J열 구분·연두색 H (insert 있을 때만)
+
+    dept_wbs: {파일경로: workbook} — 시트마다 재로드하지 않고 재사용.
     """
-    try:
-        tl = chart_obj.TopLeftCell
-        start_row = max(1, int(tl.Row) - 4)
-        end_row = int(tl.Row)
-        start_col = max(1, int(tl.Column) - 1)
-        end_col = int(tl.Column) + 8
-    except Exception:
-        return ''
+    master_wb_values = _load_master_values_workbook()
+    # 추가행과 삭제행의 구분을 위한 색상
+    fill_add = PatternFill(start_color=COLOR_ADD, end_color=COLOR_ADD, fill_type='solid')
+    fill_del = PatternFill(start_color=COLOR_DELETE, end_color=COLOR_DELETE, fill_type='solid')
 
-    candidates = []
-    for r in range(start_row, end_row + 1):
-        for c in range(start_col, end_col + 1):
-            try:
-                val = ws.Cells(r, c).Value
-            except Exception:
-                continue
-            if val is None:
-                continue
-            text = str(val).strip()
-            if not text or _is_unit_label(text):
-                continue
-            if _looks_like_section_header(text) or _match_section_keyword(text):
-                # 차트에 더 가까운 행을 우선
-                candidates.append((end_row - r, c, text))
-    if not candidates:
-        return ''
-    candidates.sort()
-    return _clean_section_title(candidates[0][2])
+    # 인덱스 구조를 판별하기 위한 글자 패턴 (예: 영어/숫자 조합 뒤에 하이픈과 숫자 -> UP-1,,,)
+    prefix_pattern = re.compile(r"^([A-Za-z0-9]+)-(\d+)$")
+    valid_prefixes = get_valid_prefixes()
 
+    # 취합해야 하는 세 가지 숫자 시트(원안, 수정1, 수정2)를 하나씩 돌며 작업합니다.
+    for sheet_name in numeric_sheets:
+        if sheet_name not in master_wb.sheetnames:
+            print(f'취합용 파일에 {sheet_name}이 없습니다.')
+            continue
 
-def extract_dashboard_data(excel_path, sheet_name, excel_app=None, include_chart_shapes=True):
-    excel_path = os.path.abspath(excel_path)
-    if not os.path.isfile(excel_path):
-        raise FileNotFoundError(excel_path)
+        master_ws = master_wb[sheet_name]
+        max_col = master_ws.max_column
+        print(f'[{sheet_name}] 인덱스 매칭 및 취합 작업 시작...')
 
-    own_excel = excel_app is None
-    if own_excel:
-        excel_app = win32.DispatchEx('Excel.Application')
-        excel_app.Visible = False
-        excel_app.DisplayAlerts = False
+        master_merge_lookup = build_merge_lookup(master_ws)
+        ws_values = (
+            master_wb_values[sheet_name]
+            if master_wb_values and sheet_name in master_wb_values.sheetnames
+            else None
+        )
+        index_store, section_baseline = build_index_store(
+            master_ws, max_col, master_merge_lookup, valid_prefixes,
+            ws_values=ws_values,
+        )
+        master_map = index_store_as_map(index_store)
+        original_master_layout = extract_section_layout_templates(
+            master_ws, valid_prefixes, col_end=max_col
+        )
+        prefix_first_rows = build_prefix_first_rows(master_map, prefix_pattern)
+        unknown_prefix_warnings = set()
+        index_validation_warnings = []
 
-    wb = None
-    charts = []
-    text_boxes = []
+        all_dept_indexes = set()
+        updated_count = 0
+        added_count = 0
+        deleted_count = 0 # 삭제 카운트 초기화 선언 보완
+        new_rows_buffer = []
+        pending_add_indexes = set()
+        fix_remap_queue = []
+        fix_virtual_indexes = set()
+        
+        # 이번 시트 처리 중 master_ws에 새로 삽입된 절대 행 번호 모음.
+        inserted_rows = set()
+        dept_dup_blocked = {}
+        all_cascade_rows = set()
 
-    try:
-        wb = excel_app.Workbooks.Open(excel_path, ReadOnly=True)
-        ws = wb.Worksheets(sheet_name)
+        dept_cache = build_dept_sheet_cache(dept_wbs, sheet_name)
 
-        for chart_obj in ws.ChartObjects():
-            charts.append({
-                'name': chart_obj.Name,
-                'title': _chart_title(chart_obj),
-                'cell_title': _cell_section_title_above_chart(ws, chart_obj),
-                'top': float(chart_obj.Top),
-                'left': float(chart_obj.Left),
-                'width': float(chart_obj.Width),
-                'height': float(chart_obj.Height),
-            })
+        for df, ctx in dept_cache.items():
+            dept_ws = ctx['ws']
+            dept_merge_lookup = ctx['merge_lookup']
+            dept_map = ctx['index_map']
+            dept_rows_sorted = ctx['rows_sorted']
 
-        for shape in _iter_shapes(ws):
-            text = _shape_text(shape)
-            if not text:
-                continue
-            text_boxes.append({
-                'name': shape.Name,
-                'text': text,
-                'top': float(shape.Top),
-                'left': float(shape.Left),
-                'width': float(shape.Width),
-                'height': float(shape.Height),
-                'source': 'sheet',
-            })
+            dup_blocked = set()
+            for idx, r1, r2 in find_duplicate_index_rows(dept_ws):
+                dup_blocked.add(idx)
+                msg = f'[인덱스 중복] {idx} — {r1}행·{r2}행에 동일 입력 (부서 파일 수정 필요)'
+                index_validation_warnings.append(msg)
+                print(f'  -> {msg}')
+            dept_dup_blocked[df] = dup_blocked
 
-        if include_chart_shapes:
-            for chart_obj in ws.ChartObjects():
-                chart = chart_obj.Chart
-                for shape in _iter_shapes(chart):
-                    text = _shape_text(shape)
-                    if not text:
+            def find_index_above(dept_row_num, _sorted=dept_rows_sorted):
+                '''부서 시트에서 dept_row_num 바로 위에 있는 H열 인덱스(예: U-4)를 반환.'''
+                above_idx = None
+                for r_num, idx in _sorted:
+                    if r_num < dept_row_num:
+                        above_idx = idx
+                    else:
+                        break
+                return above_idx
+
+            fix_plans = build_dept_index_fixup(
+                dept_map, master_map, prefix_pattern, valid_prefixes,
+                dept_ws=dept_ws, master_ws=master_ws, max_col=max_col,
+                dept_merge_lookup=dept_merge_lookup,
+                master_merge_lookup=master_merge_lookup,
+            )
+            cascade_rows = set()
+            for plan in fix_plans.values():
+                cascade_rows.update(plan['cascade_rows'])
+            all_cascade_rows.update(cascade_rows)
+
+            for prefix, plan in fix_plans.items():
+                remap_parts = []
+                for dept_idx, dept_row, master_idx in plan['remaps']:
+                    if master_idx not in master_map:
                         continue
-                    text_boxes.append({
-                        'name': shape.Name,
-                        'text': text,
-                        'top': float(chart_obj.Top + shape.Top),
-                        'left': float(chart_obj.Left + shape.Left),
-                        'width': float(shape.Width),
-                        'height': float(shape.Height),
-                        'source': 'chart',
-                        'chart_object': chart_obj.Name,
+                    fix_remap_queue.append({
+                        'master_idx': master_idx,
+                        'dept_row': dept_row,
+                        'dept_ws': dept_ws,
+                        'dept_merge_lookup': dept_merge_lookup,
                     })
-
-        text_boxes.sort(key=lambda x: (x['top'], x['left']))
-        charts.sort(key=lambda x: (x['top'], x['left']))
-        return {'charts': charts, 'text_boxes': text_boxes}
-    finally:
-        if wb is not None:
-            wb.Close(SaveChanges=False)
-        if own_excel:
-            excel_app.Quit()
-
-
-@contextmanager
-def excel_session():
-    app = win32.DispatchEx('Excel.Application')
-    app.Visible = False
-    app.DisplayAlerts = False
-    try:
-        yield app
-    finally:
-        app.Quit()
-
-
-def discover_dashboard_sheets(excel_path, excel_app=None):
-    """워크북에서 DashBoard/Dashboard 로 시작하는 시트명 목록."""
-    excel_path = os.path.abspath(excel_path)
-    own_excel = excel_app is None
-    if own_excel:
-        excel_app = win32.DispatchEx('Excel.Application')
-        excel_app.Visible = False
-        excel_app.DisplayAlerts = False
-    wb = None
-    try:
-        wb = excel_app.Workbooks.Open(excel_path, ReadOnly=True)
-        names = []
-        for i in range(1, wb.Worksheets.Count + 1):
-            name = wb.Worksheets(i).Name
-            if name.startswith(DASHBOARD_SHEET_PREFIXES):
-                names.append(name)
-        return sorted(names)
-    finally:
-        if wb is not None:
-            wb.Close(SaveChanges=False)
-        if own_excel:
-            excel_app.Quit()
-
-
-# ---------------------------------------------------------------------------
-# 전처리 · 정렬
-# ---------------------------------------------------------------------------
-
-
-def normalize_text(text: str) -> str:
-    if not isinstance(text, str):
-        return ''
-    t = re.sub(r'\s+', ' ', text.strip())
-    return t
-
-
-def extract_sort_key(text: str) -> str:
-    cleaned = re.sub(r'[()`]', '', str(text))
-    match = re.match(r'^([\d\.]+년?[\s\d\w]*)', cleaned)
-    if not match:
-        return '99.99'
-    date_part = match.group(1).strip().replace('월', '').replace('년', '')
-    parts = date_part.split('.')
-    if len(parts) == 2 and len(parts[1]) == 1 and parts[1].isdigit():
-        return f'{parts[0]}.0{parts[1]}'
-    return date_part
-
-
-def _flatten_shape_text(text: str) -> str:
-    """도형 하나의 텍스트에서 줄바꿈을 없애고 한 줄로 합침 (단위행 제외)."""
-    lines = [ln.strip() for ln in str(text).split('\n')]
-    lines = [ln for ln in lines if ln and not _is_unit_label(ln) and ln != UNIT_LABEL]
-    return ' '.join(lines)
-
-
-def process_textboxes_df(df: pd.DataFrame) -> pd.DataFrame:
-    """도형별 줄바꿈 제거(한 셀) · 단위행 제거 · chart+날짜 정렬."""
-    if df.empty:
-        return df.copy()
-
-    out = df.copy()
-    out['text'] = out['text'].astype(str).map(_flatten_shape_text)
-    out = out[out['text'] != ''].reset_index(drop=True)
-    out['text_norm'] = out['text'].map(normalize_text)
-    out['sort_key'] = out['text'].map(extract_sort_key)
-
-    sort_cols = ['chart_name', 'sort_key', 'text']
-    for col in sort_cols:
-        if col not in out.columns:
-            out[col] = ''
-    out = out.sort_values(by=sort_cols, ascending=True).reset_index(drop=True)
-    return out
-
-
-def textboxes_to_dataframe(text_boxes: list[dict]) -> pd.DataFrame:
-    if not text_boxes:
-        return pd.DataFrame(columns=OUTPUT_COLUMNS + ['text_norm', 'sort_key', 'name'])
-    return pd.DataFrame(text_boxes)
-
-
-def extract_and_process(excel_path, sheet_name, excel_app=None) -> pd.DataFrame:
-    data = extract_dashboard_data(excel_path, sheet_name, excel_app=excel_app)
-    boxes = group_text_boxes_by_chart(data['text_boxes'], data['charts'])
-    df = textboxes_to_dataframe(boxes)
-    return process_textboxes_df(df)
-
-
-# ---------------------------------------------------------------------------
-# 차트 그룹 · diff · 취합본
-# ---------------------------------------------------------------------------
-
-
-def _box_center(item):
-    return (
-        item['top'] + item['height'] / 2,
-        item['left'] + item['width'] / 2,
-    )
-
-
-def _in_bounds(cy, cx, region, margin=12):
-    return (
-        region['top'] - margin <= cy <= region['top'] + region['height'] + margin
-        and region['left'] - margin <= cx <= region['left'] + region['width'] + margin
-    )
-
-
-def _clean_section_title(text: str) -> str:
-    """섹션 제목 상자/셀 텍스트에서 머리기호를 떼고 실제 제목만 반환."""
-    first = str(text).split('\n')[0].strip()
-    return first.lstrip(SECTION_HEADER_MARKERS + ' \t').strip()
-
-
-def _match_section_keyword(text: str) -> str:
-    """알려진 섹션 키워드가 포함되면 정규화된 섹션명 반환."""
-    core = _clean_section_title(text)
-    if not core or _is_unit_label(core):
-        return ''
-    for kw in SECTION_NAME_KEYWORDS:
-        if kw in core:
-            # '부채(공사채) 발행잔고'처럼 키워드를 포함한 전체 제목 유지
-            return core
-    return ''
-
-
-def _looks_like_section_header(text: str) -> bool:
-    """
-    '□ 운영자본금'·'ㅁ 사업준비금'·'부채(공사채) 발행잔고' 등 섹션 제목 판별.
-    '(단위 : 백만원)' 및 날짜/금액 주석은 제외.
-    """
-    s = str(text).strip()
-    if not s or _is_unit_label(s):
-        return False
-    if _match_section_keyword(s):
-        return True
-    core = _clean_section_title(s)
-    if not core or _is_unit_label(core):
-        return False
-    if core.startswith('('):
-        return False
-    if any(ch.isdigit() for ch in core):
-        return False
-    return len(core) <= SECTION_TITLE_MAX_LEN
-
-
-def _pick_chart_section_title(chart, shape_title: str) -> str:
-    """셀 제목 → 도형 제목 → (단위 제외) 차트 제목 순으로 섹션명 선택."""
-    for cand in (
-        chart.get('cell_title', ''),
-        shape_title,
-        chart.get('title', ''),
-    ):
-        if not cand or _is_unit_label(cand):
-            continue
-        kw = _match_section_keyword(cand)
-        if kw:
-            return kw
-        if _looks_like_section_header(cand):
-            return _clean_section_title(cand)
-    # 차트 객체명(Chart 1 등)은 쓰지 않음 — 단위/빈 값 방지
-    return ''
-
-
-def _assign_section_titles(text_boxes, charts):
-    """
-    차트별 실제 섹션 제목 결정.
-    우선순위: 차트 위 셀 제목 → 근처 섹션 도형 → 차트 제목(단위 제외).
-    """
-    headers = [it for it in text_boxes if _looks_like_section_header(it['text'])]
-    best = {}  # ci -> (우선순위점수, 거리, 제목) 점수 낮을수록 좋음
-    for h in headers:
-        ci = min(range(len(charts)), key=lambda i: abs(charts[i]['top'] - h['top']))
-        dist = abs(charts[ci]['top'] - h['top'])
-        title = _match_section_keyword(h['text']) or _clean_section_title(h['text'])
-        # 알려진 섹션 키워드가 있으면 우선
-        score = 0 if _match_section_keyword(h['text']) else 1
-        prev = best.get(ci)
-        if prev is None or (score, dist) < (prev[0], prev[1]):
-            best[ci] = (score, dist, title)
-
-    titles = {}
-    for ci, ch in enumerate(charts):
-        shape_title = best[ci][2] if ci in best else ''
-        titles[ci] = _pick_chart_section_title(ch, shape_title)
-    return titles
-
-
-def group_text_boxes_by_chart(text_boxes, charts):
-    if not charts:
-        for item in text_boxes:
-            item['chart_title'] = ''
-            item['chart_name'] = ''
-        return text_boxes
-
-    for item in text_boxes:
-        cy, cx = _box_center(item)
-        matched = [i for i, ch in enumerate(charts) if _in_bounds(cy, cx, ch)]
-        if len(matched) == 1:
-            ci = matched[0]
-        elif matched:
-            ci = min(matched, key=lambda i: abs(cy - (charts[i]['top'] + charts[i]['height'] / 2)))
-        else:
-            ci = min(range(len(charts)), key=lambda i: abs(cy - (charts[i]['top'] + charts[i]['height'] / 2)))
-        item['_chart_idx'] = ci
-
-    chart_titles = _assign_section_titles(text_boxes, charts)
-
-    for item in text_boxes:
-        ci = item.pop('_chart_idx')
-        title = chart_titles.get(ci, '')
-        item['chart_title'] = title
-        item['chart_name'] = title
-    return text_boxes
-
-
-def _row_key(chart_name, text_norm) -> tuple:
-    return (str(chart_name or ''), str(text_norm or ''))
-
-
-def find_dept_additions(master_df: pd.DataFrame, dept_df: pd.DataFrame) -> pd.DataFrame:
-    """취합용에 없고 부서에만 있는 (chart_name, text) 조합."""
-    if dept_df.empty:
-        return dept_df.copy()
-    master_keys = {
-        _row_key(r.chart_name, r.text_norm)
-        for r in master_df.itertuples(index=False)
-    } if not master_df.empty else set()
-
-    mask = []
-    for r in dept_df.itertuples(index=False):
-        mask.append(_row_key(r.chart_name, r.text_norm) not in master_keys)
-    return dept_df.loc[mask].copy()
-
-
-def build_consolidated(master_df: pd.DataFrame, dept_results: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
-    """
-    취합본 테이블: 기존(취합용) + 부서추가(빨간 표시 대상).
-    dept_results: [(source_label, processed_df), ...]
-    """
-    rows = []
-
-    if not master_df.empty:
-        for r in master_df.itertuples(index=False):
-            rows.append({
-                'status': STATUS_EXISTING,
-                'source_file': '취합용',
-                'chart_title': getattr(r, 'chart_title', ''),
-                'chart_name': getattr(r, 'chart_name', ''),
-                'text': r.text,
-                'text_norm': r.text_norm,
-                'sort_key': r.sort_key,
-            })
-
-    seen_add_keys = set()
-    for source_label, dept_df in dept_results:
-        additions = find_dept_additions(master_df, dept_df)
-        for r in additions.itertuples(index=False):
-            key = _row_key(r.chart_name, r.text_norm)
-            if key in seen_add_keys:
-                continue
-            seen_add_keys.add(key)
-            rows.append({
-                'status': STATUS_DEPT_ADD,
-                'source_file': source_label,
-                'chart_title': getattr(r, 'chart_title', ''),
-                'chart_name': getattr(r, 'chart_name', ''),
-                'text': r.text,
-                'text_norm': r.text_norm,
-                'sort_key': r.sort_key,
-            })
-
-    if not rows:
-        return pd.DataFrame(columns=OUTPUT_COLUMNS + ['text_norm', 'sort_key'])
-
-    out = pd.DataFrame(rows)
-    out = out.sort_values(
-        by=['chart_name', 'sort_key', 'status', 'text'],
-        ascending=True,
-    ).reset_index(drop=True)
-    return out
-
-
-def _dept_label(dept_path: str) -> str:
-    base = os.path.splitext(os.path.basename(dept_path))[0]
-    for token in ('_부서명', '_부서', '분석자료'):
-        base = base.replace(token, '')
-    return base.strip() or os.path.basename(dept_path)
-
-
-def _sanitize(val):
-    # openpyxl은 스칼라(str/숫자/bool/None)만 허용. 그 외(튜플/리스트/객체 등)는 문자열로 강제.
-    if val is None or isinstance(val, (int, float, bool)):
-        return val
-    return re.sub(ILLEGAL_CHARACTERS_RE, '', str(val))
-
-def save_consolidated_xlsx(df: pd.DataFrame, xlsx_path: str):
-    """취합 데이터 + 부서추가 행 빨간 배경."""
-    export_cols = [c for c in OUTPUT_COLUMNS if c in df.columns]
-    os.makedirs(os.path.dirname(os.path.abspath(xlsx_path)), exist_ok=True)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = '취합본'
-
-    for col_idx, col_name in enumerate(export_cols, 1):
-        cell = ws.cell(row=1, column=col_idx, value=col_name)
-        cell.font = HEADER_FONT
-
-    for row_idx, row in enumerate(df.itertuples(index=False), 2):
-        is_add = getattr(row, 'status', '') == STATUS_DEPT_ADD
-        for col_idx, col_name in enumerate(export_cols, 1):
-            val = _sanitize(getattr(row, col_name, ''))
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            if is_add:
-                cell.fill = FILL_DEPT_ADD
-
-    for col_idx, col_name in enumerate(export_cols, 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(40, max(12, len(col_name) + 2))
-
-    wb.save(xlsx_path)
-
-
-def aggregate_dashboard_consolidation(
-    master_path,
-    dept_paths,
-    output_dir,
-    sheet_names=None,
-    ):
-    """
-    취합용 + 부서 DashBoard 텍스트 추출·diff·취합본 XLSX 저장.
-
-    Returns:
-        dict[sheet_name] -> {'xlsx': path, 'add_count': int}
-    """
-    master_path = os.path.abspath(master_path)
-    output_dir = os.path.abspath(output_dir)
-    os.makedirs(output_dir, exist_ok=True)
-
-    results = {}
-    with excel_session() as excel_app:
-        if sheet_names is None:
-            sheet_names = discover_dashboard_sheets(master_path, excel_app=excel_app)
-        if not sheet_names:
-            print('  DashBoard 시트가 없습니다 — 건너뜀.')
-            return results
-
-        for sheet_name in sheet_names:
-            print(f'  [{sheet_name}] DashBoard 텍스트 추출·취합...')
-            try:
-                master_df = extract_and_process(master_path, sheet_name, excel_app=excel_app)
-            except Exception as e:
-                print(f'    취합용 추출 실패: {e}')
-                continue
-
-            dept_results = []
-            for dept_path in dept_paths:
-                label = _dept_label(dept_path)
-                try:
-                    dept_df = extract_and_process(dept_path, sheet_name, excel_app=excel_app)
-                    dept_results.append((label, dept_df))
-                except Exception as e:
-                    print(f'    부서 {label} 스킵 ({e})')
-
-            consolidated = build_consolidated(master_df, dept_results)
-            add_count = int((consolidated['status'] == STATUS_DEPT_ADD).sum()) if not consolidated.empty else 0
-
-            safe_sheet = re.sub(r'[\\/:*?"<>|]', '_', sheet_name)
-            folder_file = os.path.join(output_dir, '최종취합본')
-            os.makedirs(folder_file, exist_ok=True)
-            xlsx_path = os.path.join(folder_file, f'dashboard_{safe_sheet}_취합본.xlsx')
-
-            save_consolidated_xlsx(consolidated, xlsx_path)
-
-            print(f'    기존 {len(master_df)}건 / 부서추가 {add_count}건')
-            print(f'    XLSX → {xlsx_path} (부서추가=빨간 배경)')
-
-            results[sheet_name] = {
-                'xlsx': xlsx_path,
-                'add_count': add_count,
-                'rows': len(consolidated),
-            }
-
-    return results
-
-
-def strip_dashboard_sheets(workbook) -> list[str]:
-    """
-    openpyxl 워크북에서 DashBoard 시트를 제거한다.
-
-    openpyxl이 차트/도형이 있는 시트를 저장하면 xl/drawings 관계가 깨져
-    Excel이 '내용을 복구하시겠습니까?' / Open 오류를 낸다.
-    저장 전에 대시보드 시트를 빼 두고, 저장 후 COM으로 취합용 원본을 붙인다.
-    """
-    removed = [
-        name for name in list(workbook.sheetnames)
-        if name.startswith(DASHBOARD_SHEET_PREFIXES)
-    ]
-    for name in removed:
-        del workbook[name]
-    # 남은 시트에도 부분적으로 로드된 차트/이미지 참조가 있으면 제거
-    for ws in workbook.worksheets:
-        if hasattr(ws, '_charts'):
-            ws._charts = []
-        if hasattr(ws, '_images'):
-            ws._images = []
-    return removed
-
-
-def purge_xlsx_drawing_parts(xlsx_path: str) -> None:
-    """
-    openpyxl 저장본 xlsx 안에서 깨진 도면/차트 패키지 조각을 제거한다.
-
-    DashBoard 시트를 지워도 xl/drawings·xl/charts·worksheet의 <drawing> 태그/
-    .rels 링크가 남아 있으면 Excel Workbooks.Open이
-    'Open 메서드에 오류가 있습니다'(-2146827284)로 실패한다.
-    """
-    import zipfile
-    from io import BytesIO
-
-    xlsx_path = os.path.abspath(xlsx_path)
-    buf = BytesIO()
-
-    def _clean_content_types(data: bytes) -> bytes:
-        text = data.decode('utf-8', errors='ignore')
-        text = re.sub(
-            r'<Override[^>]+(drawings/|charts/|chartsheets/)[^/]*/>',
-            '',
-            text,
-        )
-        return text.encode('utf-8')
-
-    def _clean_rels(data: bytes) -> bytes:
-        text = data.decode('utf-8', errors='ignore')
-        text = re.sub(
-            r'<Relationship[^>]+Type="[^"]*(drawing|chart|chartsheet)[^"]*"[^/]*/>',
-            '',
-            text,
-            flags=re.IGNORECASE,
-        )
-        return text.encode('utf-8')
-
-    def _clean_sheet_xml(data: bytes) -> bytes:
-        text = data.decode('utf-8', errors='ignore')
-        text = re.sub(r'<drawing[^>]*?/>', '', text)
-        text = re.sub(r'<drawing[^>]*>.*?</drawing>', '', text, flags=re.DOTALL)
-        text = re.sub(r'<legacyDrawing[^>]*?/>', '', text)
-        text = re.sub(r'<legacyDrawingHF[^>]*?/>', '', text)
-        return text.encode('utf-8')
-
-    skip_prefixes = (
-        'xl/drawings/',
-        'xl/charts/',
-        'xl/chartsheets/',
-    )
-    with zipfile.ZipFile(xlsx_path, 'r') as zin, \
-            zipfile.ZipFile(buf, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-        for info in zin.infolist():
-            name = info.filename.replace('\\', '/')
-            if any(name.startswith(p) for p in skip_prefixes):
-                continue
-            data = zin.read(info.filename)
-            base = name.rsplit('/', 1)[-1]
-            if name == '[Content_Types].xml':
-                data = _clean_content_types(data)
-            elif name.endswith('.rels'):
-                data = _clean_rels(data)
-            elif name.startswith('xl/worksheets/') and base.endswith('.xml'):
-                data = _clean_sheet_xml(data)
-            # ZipInfo 재사용 시 암호/플래그 이슈 피하려면 새 이름으로 기록
-            zout.writestr(name, data)
-
-    with open(xlsx_path, 'wb') as f:
-        f.write(buf.getvalue())
-
-
-def _excel_open_workbook(excel_app, path, read_only=False, allow_repair=True):
-    """
-    Workbooks.Open 안전 호출.
-
-    - DispatchEx에서는 keyword 인자 금지 → Open(path, UpdateLinks, ReadOnly) 위치 인자만
-    - 경로 특수문자 대비 temp 복사 재시도
-    - 그래도 실패하고 allow_repair면 도면 잔여물 purge 후 재시도
-    """
-    import shutil
-    import tempfile
-
-    path = os.path.abspath(path)
-
-    def _open(p):
-        # UpdateLinks=0, ReadOnly=bool
-        return excel_app.Workbooks.Open(p, 0, bool(read_only))
-
-    errors = []
-    try:
-        return _open(path)
-    except Exception as e:
-        errors.append(f'직접 열기: {e}')
-
-    safe_name = re.sub(r'[^\w.\-]+', '_', os.path.basename(path))
-    tmp = os.path.join(tempfile.gettempdir(), f'cashflow_open_{os.getpid()}_{safe_name}')
-    try:
-        shutil.copy2(path, tmp)
-        return _open(tmp)
-    except Exception as e:
-        errors.append(f'temp 복사 열기: {e}')
-
-    if allow_repair and not read_only:
-        try:
-            print('  openpyxl 저장본 도면/차트 잔여물 제거 후 재시도...')
-            purge_xlsx_drawing_parts(path)
-            shutil.copy2(path, tmp)
-            return _open(tmp)
-        except Exception as e:
-            errors.append(f'purge 후 열기: {e}')
-
-    raise RuntimeError(
-        'Excel Workbooks.Open 실패\n'
-        f'  경로: {path}\n  ' + '\n  '.join(errors)
-    )
-
-
-def restore_dashboard_sheets_to_output(master_path, output_path, sheet_names=None, excel_app=None):
-    """
-    취합용(master) DashBoard 시트를 최종 취합본(output)에 붙인다.
-
-    전제: output은 openpyxl 저장 전에 DashBoard가 제거된 '깨끗한' 파일이어야
-    Excel 복구 프롬프트가 뜨지 않는다.
-
-    절차:
-      (1) output에 남아 있는 동명 DashBoard가 있으면 삭제
-      (2) master 시트를 Copy() → Move로 output에 삽입
-      (3) 로컬 temp에 SaveAs 후 최종 경로로 복사 (OneDrive 잠금/동기화 회피)
-
-    Returns: 복원된 시트명 리스트.
-    """
-    import shutil
-    import tempfile
-
-    master_path = os.path.abspath(master_path)
-    output_path = os.path.abspath(output_path)
-    if not os.path.isfile(master_path) or not os.path.isfile(output_path):
-        print('  DashBoard 복원 스킵 — master/output 파일을 찾을 수 없습니다.')
-        return []
-
-    own_excel = excel_app is None
-    if own_excel:
-        excel_app = win32.DispatchEx('Excel.Application')
-        excel_app.Visible = False
-        excel_app.DisplayAlerts = False
-        try:
-            excel_app.AskToUpdateLinks = False
-            excel_app.AlertBeforeOverwriting = False
-        except Exception:
-            pass
-
-    restored = []
-    out_wb = None
-    mas_wb = None
-    xl_openxml = 51  # xlOpenXMLWorkbook
-    clean_path = os.path.join(
-        tempfile.gettempdir(),
-        f'cashflow_dashboard_restore_{os.getpid()}.xlsx',
-    )
-    try:
-        # 취합용(원본)부터 열어 Excel COM 자체가 동작하는지 확인
-        print(f'  취합용 Open: {master_path}')
-        mas_wb = _excel_open_workbook(
-            excel_app, master_path, read_only=True, allow_repair=False,
-        )
-
-        # openpyxl 저장본은 도면 잔여물이 있을 수 있어 Open 전에 purge
-        try:
-            purge_xlsx_drawing_parts(output_path)
-        except Exception as e:
-            print(f'  최종파일 purge 경고: {e}')
-
-        print(f'  최종파일 Open: {output_path}')
-        out_wb = _excel_open_workbook(
-            excel_app, output_path, read_only=False, allow_repair=True,
-        )
-
-        out_names = {out_wb.Worksheets(i).Name for i in range(1, out_wb.Worksheets.Count + 1)}
-        mas_names = {
-            mas_wb.Worksheets(i).Name
-            for i in range(1, mas_wb.Worksheets.Count + 1)
-        }
-        if sheet_names is None:
-            # 취합용 시트 순서 유지
-            sheet_names = [
-                mas_wb.Worksheets(i).Name
-                for i in range(1, mas_wb.Worksheets.Count + 1)
-                if mas_wb.Worksheets(i).Name.startswith(DASHBOARD_SHEET_PREFIXES)
-            ]
-
-        excel_app.DisplayAlerts = False
-        for sheet_name in sheet_names:
-            if sheet_name not in mas_names:
-                print(f'  [{sheet_name}] 취합용에 시트가 없어 복원 스킵.')
-                continue
-            try:
-                insert_after = None
-                if sheet_name in out_names:
-                    old = out_wb.Worksheets(sheet_name)
-                    idx = int(old.Index)
-                    if idx > 1:
-                        insert_after = out_wb.Worksheets(idx - 1)
-                    old.Delete()
-                    out_names.discard(sheet_name)
-
-                if out_wb.Worksheets.Count < 1:
-                    out_wb.Worksheets.Add()
-
-                # master → 임시 통합문서(Copy 무인자) → output으로 Move
-                src = mas_wb.Worksheets(sheet_name)
-                src.Copy()
-                temp_sheet = excel_app.ActiveWorkbook.Worksheets(1)
-                if insert_after is not None:
-                    temp_sheet.Move(After=insert_after)
-                else:
-                    # openpyxl 저장 전 제거된 경우 → 맨 뒤에 추가
-                    temp_sheet.Move(After=out_wb.Worksheets(out_wb.Worksheets.Count))
-
-                current_names = {
-                    out_wb.Worksheets(i).Name
-                    for i in range(1, out_wb.Worksheets.Count + 1)
-                }
-                if sheet_name not in current_names:
-                    out_wb.ActiveSheet.Name = sheet_name
-
-                # 도형 복원 여부 확인
-                ws = out_wb.Worksheets(sheet_name)
-                n_shapes = int(ws.Shapes.Count)
-                n_charts = int(ws.ChartObjects().Count)
-                chart_shapes = 0
-                for ci in range(1, n_charts + 1):
-                    try:
-                        chart_shapes += int(ws.ChartObjects(ci).Chart.Shapes.Count)
-                    except Exception:
-                        pass
-
-                out_names.add(sheet_name)
-                restored.append(sheet_name)
+                    remap_parts.append(f'{dept_idx}→{master_idx}')
+                if remap_parts:
+                    print(f'  -> [인덱스 자동보정] {", ".join(remap_parts)}')
+                    all_dept_indexes.update(
+                        master_idx for master_idx, _, _ in plan['remaps']
+                        if master_idx in master_map
+                    )
+
+                anchor_idx_str = plan['anchor_idx'] or find_index_above(plan['insert_row'])
+                if plan['new_index'] not in pending_add_indexes and plan['new_index'] not in master_map:
+                    new_rows_buffer.append({
+                        'idx_str': plan['new_index'],
+                        'dept_ws': dept_ws,
+                        'dept_row': plan['insert_row'],
+                        'prefix': prefix,
+                        'anchor_idx_str': anchor_idx_str,
+                        'dept_merge_lookup': dept_merge_lookup,
+                        'auto_fixup': True,
+                    })
+                    pending_add_indexes.add(plan['new_index'])
+                all_dept_indexes.update(fix_plan_virtual_indexes(plan))
+                fix_virtual_indexes.update(fix_plan_virtual_indexes(plan))
                 print(
-                    f'  [{sheet_name}] 복원 완료 '
-                    f'(시트도형 {n_shapes}, 차트 {n_charts}, 차트내도형 {chart_shapes})'
+                    f'  -> [인덱스 자동보정] 삽입행 {plan["insert_idx"]} '
+                    f'(부서 {plan["insert_row"]}행) → {plan["new_index"]}'
                 )
-            except Exception as e:
-                print(f'  [{sheet_name}] 대시보드 복원 실패: {e}')
 
-        if restored:
-            if os.path.isfile(clean_path):
-                try:
-                    os.remove(clean_path)
-                except OSError:
+            for idx_str, info in dept_map.items():
+                if idx_str in dup_blocked:
+                    continue
+                dept_row = info['row_num']
+                if dept_row in cascade_rows:
+                    continue
+
+                all_dept_indexes.add(idx_str)
+
+                if idx_str in master_map:
+                    # 취합용 파일에 이미 존재하는 인덱스들의 일반 수정셀 취합은 
+                    # 신규 행 추가가 완료되어 행 번호가 최종 확정된 이후(하단 루프)에 처리합니다.
                     pass
-            # OneDrive 경로에 직접 SaveAs 하면 동기화/잠금으로 깨질 수 있어
-            # 로컬 temp에 저장한 뒤 최종 경로로 복사한다.
-            out_wb.SaveAs(clean_path, FileFormat=xl_openxml)
-            out_wb.Close(SaveChanges=False)
-            out_wb = None
-            mas_wb.Close(SaveChanges=False)
-            mas_wb = None
-            shutil.copy2(clean_path, output_path)
-    finally:
-        if out_wb is not None:
-            try:
-                out_wb.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if mas_wb is not None:
-            try:
-                mas_wb.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if os.path.isfile(clean_path):
-            try:
-                os.remove(clean_path)
-            except OSError:
-                pass
-        if own_excel:
-            excel_app.Quit()
+                else:
+                    # [행 추가] 부서 H열에 직접 입력한 신규 인덱스만 추가
+                    prefix = extract_prefix(idx_str, prefix_pattern)
+                    if prefix is not None and not is_allowed_index_prefix(
+                        prefix, master_map, valid_prefixes
+                    ):
+                        unknown_prefix_warnings.add(idx_str)
+                        continue
 
-    return restored
+                    ok, val_msg, suggested = validate_new_index(
+                        idx_str, prefix, master_map, pending_add_indexes, prefix_pattern
+                    )
+                    if not ok:
+                        index_validation_warnings.append(val_msg)
+                        print(f'  -> [인덱스 오류] {val_msg}')
+                        continue
 
+                    if idx_str in pending_add_indexes or idx_str in master_map:
+                        continue
 
-# ---------------------------------------------------------------------------
-# CLI · 하위 호환
-# ---------------------------------------------------------------------------
+                    if should_skip_dept_new_index_add(
+                        idx_str, prefix, dept_map, master_map, prefix_pattern,
+                        fix_plans, dept_ws=dept_ws, master_ws=master_ws,
+                        max_col=max_col, dept_merge_lookup=dept_merge_lookup,
+                        master_merge_lookup=master_merge_lookup,
+                    ):
+                        if prefix not in fix_plans:
+                            print(
+                                f'  -> [인덱스] {idx_str} 하단 추가 생략 '
+                                f'(재번호 자동보정 대상 — 삽입행→{get_suggested_new_index(master_map, prefix)})'
+                            )
+                        continue
 
+                    anchor_idx_str = find_index_above(dept_row)
+                    new_rows_buffer.append({
+                        'idx_str': idx_str, 'dept_ws': dept_ws, 'dept_row': dept_row,
+                        'prefix': prefix, 'anchor_idx_str': anchor_idx_str,
+                        'dept_merge_lookup': dept_merge_lookup,
+                    })
+                    pending_add_indexes.add(idx_str)
+                    print(f'  -> [신규 인덱스] {idx_str} (부서 {dept_row}행)')
 
-def save_text_boxes_csv(text_boxes, csv_path):
-    fields = ['chart_title', 'chart_name', 'name', 'text']
-    with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
-        writer.writeheader()
-        for item in text_boxes:
-            writer.writerow(item)
+        # ---- LAYER 1: MAP — insert·행번호·baseline L열~ ----
+        inserted_rows, added_index_values, master_map, master_merge_lookup = (
+            map_execute_row_inserts(
+                master_ws, index_store, new_rows_buffer, master_map,
+                prefix_first_rows, max_col, inserted_rows,
+            )
+        )
+        added_count += len(added_index_values)
+        all_dept_indexes.update(added_index_values)
 
+        skip_align = set(added_index_values) | fix_virtual_indexes
 
-def extract_text_boxes(excel_path, sheet_name='DashBoard2', include_chart_shapes=True):
-    return extract_dashboard_data(excel_path, sheet_name, include_chart_shapes=include_chart_shapes)['text_boxes']
+        inserted_rows, master_merge_lookup, _align_applied = map_sync_prefix_alignment(
+            master_ws, index_store, dept_cache, prefix_pattern,
+            skip_align, max_col, master_merge_lookup, inserted_rows,
+        )
+        master_map = index_store_as_map(index_store)
 
+        map_restore_after_structural(
+            master_ws, index_store, master_merge_lookup, skip_align,
+        )
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description='DashBoard 텍스트 상자 추출·취합')
-    sub = parser.add_subparsers(dest='command')
+        # ---- LAYER 2: DEPT DIFF — 파란셀·remap·신규행 데이터 ----
+        updated_count += dept_apply_blue_cell_updates(
+            master_ws, dept_cache, master_map, max_col,
+            master_merge_lookup, all_cascade_rows, dept_dup_blocked,
+        )
 
-    ext = sub.add_parser('extract', help='단일 파일 추출 CSV')
-    ext.add_argument('excel_path')
-    ext.add_argument('--sheet', default='DashBoard2')
+        if new_rows_buffer or fix_remap_queue:
+            updated_count += dept_apply_remap_and_new_rows(
+                master_ws, master_map, fix_remap_queue, new_rows_buffer,
+                max_col, master_merge_lookup, fill_add=fill_add,
+            )
 
-    con = sub.add_parser('consolidate', help='취합용+부서 diff 취합본')
-    con.add_argument('master_path')
-    con.add_argument('--dept-dir', help='부서별파일 폴더')
-    con.add_argument('--output-dir', help='출력 폴더 (기본: master와 동일)')
-    con.add_argument('--sheet', action='append', help='시트명 (반복 가능)')
+        # ---- LAYER 3: EXCEL LAYOUT — I~L 병합·J열 구분·연두색 H ----
+        if new_rows_buffer or inserted_rows:
+            master_merge_lookup = excel_layout_restore_after_inserts(
+                master_ws, original_master_layout, valid_prefixes,
+                prefix_pattern, index_store, section_baseline,
+                master_map, fix_remap_queue, new_rows_buffer,
+                skip_align, inserted_rows, added_index_values,
+                max_col, fill_add,
+            )
+            updated_count += fix_formulas_after_inserts(
+                master_ws, inserted_rows, max_col, master_merge_lookup,
+            )
+            updated_count += dept_sync_all_index_rows(
+                master_ws, dept_cache, master_map, max_col,
+                master_merge_lookup, skip_align, all_cascade_rows, dept_dup_blocked,
+            )
+            updated_count += dept_apply_blue_cell_updates(
+                master_ws, dept_cache, master_map, max_col,
+                master_merge_lookup, all_cascade_rows, dept_dup_blocked,
+            )
 
-    args = parser.parse_args(argv)
-    if args.command is None:
-        parser.print_help()
-        return
+        # ---- DEPT DIFF: prefix 담당 부서에 없는 인덱스 → H열 빨간색 ----
+        deleted_count += dept_mark_deleted_indexes(
+            master_ws, index_store, dept_cache, master_map,
+            prefix_pattern, valid_prefixes, fill_del, skip_indexes=skip_align,
+        )
 
-    if args.command == 'extract':
-        df = extract_and_process(args.excel_path, args.sheet)
-        out = os.path.splitext(args.excel_path)[0] + f'_{args.sheet}_processed.csv'
-        df.to_csv(out, index=False, encoding='utf-8-sig')
-        print(f'저장: {out} ({len(df)}건)')
-        return
+        # 부서별 코드에 없는 부서는 처리되지 않습니다.
+        if unknown_prefix_warnings:
+            print(
+                f'정의되지 않은 부서 코드: {len(unknown_prefix_warnings)}건 건너뜀 '
+                f'{sorted(unknown_prefix_warnings)}'
+            )
+        if index_validation_warnings:
+            print(f' 인덱스 검증 경고 {len(index_validation_warnings)}건 — 위 안내대로 부서 파일 수정 후 재취합하세요.')
 
-    dept_dir = args.dept_dir or os.path.join(os.path.dirname(args.master_path), '부서별파일')
-    output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.master_path))
-    dept_paths = sorted(
-        os.path.join(dept_dir, f)
-        for f in os.listdir(dept_dir)
-        if f.endswith('.xlsx') and not f.startswith('~$')
-    ) if os.path.isdir(dept_dir) else []
+        print(f'>> {sheet_name} 처리 완료 / 수정: {updated_count}건, 추가: {added_count}건, 삭제: {deleted_count}건\n')
+# ------------------------------------
+# 텍스트 시트 단순 행 대체
+def aggregate_text_sheets(master_wb, dept_wbooks, text_sheets):
+    """
+    [함수 설명] 전월대비 비교나 지출계획 등 텍스트 중심 시트 내용을 취합합니다.
+    [원리] 인덱스 번호 없이, 행 단위로 부서 파일의 파란색 수정 마크가 감지되면 해당 취합용 행 전체를 덮어씌웁니다.
+    """
+    for sheet_name in text_sheets:
+        if sheet_name not in master_wb.sheetnames:
+            print(f'{sheet_name} 시트가 취합용 파일에 없습니다.')
+            continue
 
+        master_ws = master_wb[sheet_name]
+        print(f'[{sheet_name}] 텍스트 중심 서술형 시트 취합 시작.')
+
+        max_row = master_ws.max_row
+        max_col = master_ws.max_column
+        replace_row_count = 0
+        master_merge_lookup = build_merge_lookup(master_ws)
+        dept_merge_lookups = {}
+        for dept_wb in dept_wbooks:
+            if sheet_name in dept_wb.sheetnames:
+                dept_merge_lookups[id(dept_wb)] = build_merge_lookup(dept_wb[sheet_name])
+
+        for r in range(1, max_row + 1):
+            row_replaced = False
+
+            for dept_wb in dept_wbooks:
+                if row_replaced: break # 해당 행이 이미 교체 완료되었다면 다음 파일 검사 패스
+
+                if sheet_name in dept_wb.sheetnames:
+                    dept_ws = dept_wb[sheet_name]
+                    dept_ml = dept_merge_lookups.get(id(dept_wb))
+
+                    for c in range(1, max_col + 1):
+                        dept_cell_raw = dept_ws.cell(row=r, column=c)
+                        d_eff = get_real_cell(dept_ws, dept_cell_raw, dept_ml)
+                        if not is_blue_cell(dept_cell_raw) and not is_blue_cell(d_eff):
+                            continue
+
+                        print(f'  -> [파란색 셀 포착] {r}행 {c}열 / 해당 {r}행 전체를 이식합니다.')
+
+                        for copy_c in range(1, max_col + 1):
+                            m_cell_raw = master_ws.cell(row=r, column=copy_c)
+                            d_cell_raw = dept_ws.cell(row=r, column=copy_c)
+                            m_cell = get_real_cell(master_ws, m_cell_raw, master_merge_lookup)
+                            d_cell = get_real_cell(dept_ws, d_cell_raw, dept_ml)
+                            is_blue = is_blue_cell(d_cell_raw) or is_blue_cell(d_cell)
+
+                            if d_cell.value is not None or is_blue:
+                                m_cell.value = d_cell.value
+
+                            if is_blue:
+                                d_color = str(d_cell.fill.start_color.rgb).upper()
+                                m_cell.fill = PatternFill(
+                                    start_color=d_color, end_color=d_color, fill_type='solid'
+                                )
+
+                        replace_row_count += 1
+                        row_replaced = True
+                        break
+
+        print(f'>> {sheet_name} 텍스트 취합 완료  / 총 {replace_row_count}개 행 교체 완료.\n')
+
+# ------------------------------------------
+# 실행
+if __name__ == "__main__":
+    import sys
+    PROFILE = os.environ.get('CF_PROFILE', '').strip() in ('1', 'true', 'yes')
+
+    print("====================================================")
+    print(f" [{prev_year_short}년 {prev_month:02d}월 기준] 자동 취합")
+    print("====================================================")
+    start_time = time.time()
+
+    if os.path.exists(master_file):
+        master_wb = openpyxl.load_workbook(
+            master_file, data_only=False, keep_links=False, keep_vba=False
+        )
+        print(' 취합용 파일 로드')
+    else:
+        print(f' 취합용 파일이 경로에 없습니다: {master_file}')
+        sys.exit(1)
+
+    all_dept_xlsx = [
+        f for f in glob.glob(os.path.join(target_folder, '*.xlsx'))
+        if os.path.basename(f) != os.path.basename(master_file)
+        and not os.path.basename(f).startswith('~$')
+    ]
+    dept_files = [
+        f for f in all_dept_xlsx
+        if dept_file_matches_prev_month(f, prev_year_short, prev_month, numeric_sheets)
+    ]
+    skipped_dept_files = [f for f in all_dept_xlsx if f not in dept_files]
+
+    print(f' 전월({prev_year_short}.{prev_month:02d}) 취합 대상 부서 파일 총 {len(dept_files)}개 발견.')
+    if skipped_dept_files:
+        print(f'      (기준 외 파일 {len(skipped_dept_files)}개 제외)')
+
+    if not dept_files:
+        print(" 취합 요건을 충족하는 부서별 파일이 없습니다.")
+        sys.exit(1)
+
+    dept_wbs = load_dept_workbooks(dept_files)
+    if not dept_wbs:
+        print(" 부서 파일을 열 수 없습니다.")
+        sys.exit(1)
+
+    print("\n 숫자 시트 취합 시작.")
+    if PROFILE:
+        with cProfile.Profile() as pr:
+            aggregate_numeric_sheets(master_wb, dept_wbs, numeric_sheets)
+        pr.dump_stats('aggregate_numeric_sheets.prof')
+        print(' (프로파일 저장: aggregate_numeric_sheets.prof)')
+    else:
+        aggregate_numeric_sheets(master_wb, dept_wbs, numeric_sheets)
+
+    print(" 텍스트 시트 취합 시작.")
+    dept_wbook_list = list(dept_wbs.values())
+    if PROFILE:
+        with cProfile.Profile() as pr2:
+            aggregate_text_sheets(master_wb, dept_wbook_list, text_sheets)
+        pr2.dump_stats('aggregate_text_sheets.prof')
+        print(' (프로파일 저장: aggregate_text_sheets.prof)')
+    else:
+        aggregate_text_sheets(master_wb, dept_wbook_list, text_sheets)
+
+    print(' DashBoard 텍스트 취합 시작.')
+    from dashboard import aggregate_dashboard_consolidation
     aggregate_dashboard_consolidation(
-        args.master_path,
-        dept_paths,
-        output_dir,
-        sheet_names=args.sheet or None,
+        master_path=master_file,
+        dept_paths=dept_files,
+        output_dir=base_path,
     )
 
+    for wb in dept_wbs.values():
+        wb.close()
+    
+    # 5단계: 최종 취합본 파일 저장
+    end_time = time.time()
+    elapsed = end_time - start_time
+    print("====================================================")
+    print(f" 소요 시간: {int(elapsed // 60)}분 {int(elapsed % 60)}초")
 
-if __name__ == '__main__':
-    main()
+    folder_file = os.path.join(base_path, '최종취합본')
+    os.makedirs(folder_file, exist_ok=True)
+    output_file = os.path.join(folder_file, f"도시개발본부_현금흐름_최종취합_완성본({prev_year_short}.{prev_month:02d}).xlsx")
+
+    # openpyxl이 DashBoard(차트/도형)를 저장하면 xlsx 도면 XML이 깨져
+    # Excel Open이 실패함 → 저장 전 시트 제거 + 저장 후 도면 잔여물 purge
+    from dashboard import (
+        strip_dashboard_sheets,
+        purge_xlsx_drawing_parts,
+        restore_dashboard_sheets_to_output,
+    )
+    removed_dash = strip_dashboard_sheets(master_wb)
+    if removed_dash:
+        print(f" openpyxl 안전 저장을 위해 DashBoard 시트 임시 제외: {', '.join(removed_dash)}")
+
+    master_wb.save(output_file)
+    master_wb.close()
+    try:
+        purge_xlsx_drawing_parts(output_file)
+        print(" openpyxl 저장본 도면/차트 잔여 패키지 정리 완료")
+    except Exception as e:
+        print(f" 도면 잔여 패키지 정리 경고(복원에서 재시도): {e}")
+    print(f" 최종 취합본 파일 저장완료 \n -> 경로: {output_file}")
+
+    # 취합용 원본에서 DashBoard(도형·차트·텍스트)를 COM으로 붙임
+    print(" DashBoard 시트 도형·텍스트 복원 중...")
+    try:
+        restored = restore_dashboard_sheets_to_output(master_file, output_file)
+        if restored:
+            print(f" DashBoard 복원 완료: {', '.join(restored)}")
+        else:
+            print(" DashBoard 복원 대상 시트 없음(또는 모두 스킵).")
+    except Exception as e:
+        print(f" DashBoard 복원 실패(숫자/텍스트 취합은 저장됨): {e}")
+    print("====================================================")
+
