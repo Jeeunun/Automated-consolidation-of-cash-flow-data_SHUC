@@ -68,7 +68,7 @@ numeric_sheets = [
 text_sheets = ["전월대비 비교", f'{prev_year_short}-{int(prev_year_short)+1} 지출계획']
 
 # 고정된 폴더 및 파일 경로 설정
-base_path = r'C:\Users\Desktop\인턴\3)현금흐름'    ####=====!!!!!!!! 추후 수정해야할 필요있음!!!!!!!======####
+base_path = r'C:\Users\user\Desktop\인턴\3)현금흐름'    ####=====!!!!!!!! 추후 수정해야할 필요있음!!!!!!!======####
 file_name = f'도시개발본부 현금흐름 분석자료({prev_year_short}.{prev_month:02d}.기준)_부서명.xlsx'
 master_file = os.path.join(base_path, file_name)
 target_folder = os.path.join(base_path, '부서별파일')
@@ -921,6 +921,86 @@ def strip_external_link_refs(wb, sheet_names=None):
                     fixed.append((name, cell.coordinate, v, new_v))
                     cell.value = new_v
     return fixed
+
+
+def repair_master_external_link_refs(path, sheet_names=('Parameter',)):
+    '''
+    취합용 원본 xlsx의 깨진 외부 참조([n]Sheet!)를 내부 참조로 고친 뒤 저장.
+
+    openpyxl로 저장하면 DashBoard 도면이 깨질 수 있어 Excel COM으로만 저장한다.
+    기본 대상: Parameter 시트 (A6:E6의 MATCH([1]DashBoard2!...) 등).
+    반환: [(sheet, coord, old, new), ...]
+    '''
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        return []
+
+    import win32com.client as win32
+
+    excel = None
+    wb = None
+    fixed = []
+    try:
+        excel = win32.DispatchEx('Excel.Application')
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        try:
+            excel.AskToUpdateLinks = False
+        except Exception:
+            pass
+
+        # UpdateLinks=0: 깨진 외부 링크 갱신 시도 없이 연다
+        wb = excel.Workbooks.Open(path, UpdateLinks=0, ReadOnly=False)
+
+        if sheet_names:
+            targets = list(sheet_names)
+        else:
+            targets = [
+                wb.Worksheets(i).Name
+                for i in range(1, wb.Worksheets.Count + 1)
+            ]
+
+        for name in targets:
+            try:
+                ws = wb.Worksheets(name)
+            except Exception:
+                continue
+            try:
+                used = ws.UsedRange
+                row0, col0 = int(used.Row), int(used.Column)
+                n_rows, n_cols = int(used.Rows.Count), int(used.Columns.Count)
+            except Exception:
+                row0, col0, n_rows, n_cols = 1, 1, 20, 10
+
+            for r in range(row0, row0 + n_rows):
+                for c in range(col0, col0 + n_cols):
+                    cell = ws.Cells(r, c)
+                    try:
+                        formula = cell.Formula
+                    except Exception:
+                        continue
+                    if not (isinstance(formula, str) and formula.startswith('=')
+                            and _EXT_LINK_PATTERN.search(formula)):
+                        continue
+                    new_f = _EXT_LINK_PATTERN.sub('', formula)
+                    cell.Formula = new_f
+                    coord = cell.Address.replace('$', '')
+                    fixed.append((name, coord, formula, new_f))
+
+        if fixed:
+            wb.Save()
+        return fixed
+    finally:
+        if wb is not None:
+            try:
+                wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if excel is not None:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
 
 def fix_formulas_after_inserts(ws, inserted_rows, max_col, merge_lookup=None):
     '''

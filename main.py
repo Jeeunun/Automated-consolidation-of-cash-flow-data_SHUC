@@ -15,6 +15,7 @@ from utils import (
     map_execute_row_inserts, map_sync_prefix_alignment, map_restore_after_structural,
     dept_apply_blue_cell_updates,     dept_apply_remap_and_new_rows, dept_sync_all_index_rows,
     dept_mark_deleted_indexes, excel_layout_restore_after_inserts, fix_formulas_after_inserts,
+    strip_external_link_refs, repair_master_external_link_refs,
     build_prefix_first_rows, copy_cell_style_safe,
     is_layout_col, should_capture_layout_cell,
     capture_cell_style, apply_cell_style, safe_unmerge_cells, get_valid_prefixes,
@@ -37,15 +38,8 @@ def _load_master_values_workbook():
     '''L열~ 수식의 계산값 스냅샷용 (data_only).'''
     if os.path.exists(master_file):
         return openpyxl.load_workbook(
-            master_file, data_only=True, keep_links=False, keep_vda=False
+            master_file, data_only=True, keep_links=False,
         )
-
-    fixed_refs = strip_external_link_refs(master_wb, sheet_names=['Parameter'])
-    if fixed_refs:
-        print(f" 외부참조(끊어진 링크) {len(fixed_refs)}건을 내부참조로 자동 변환:")
-        for sheet, coord, old, new in fixed_refs:
-            print(f"   - {sheet}!{coord}: {old}  ->  {new}")
-    print(' 취합용 파일 로드')
     return None
 
 # ------------------------------------
@@ -389,14 +383,28 @@ if __name__ == "__main__":
     print("====================================================")
     start_time = time.time()
 
-    if os.path.exists(master_file):
-        master_wb = openpyxl.load_workbook(
-            master_file, data_only=False, keep_links=False, keep_vba=False
-        )
-        print(' 취합용 파일 로드')
-    else:
+    if not os.path.exists(master_file):
         print(f' 취합용 파일이 경로에 없습니다: {master_file}')
         sys.exit(1)
+
+    # 취합용 원본 Parameter 등: [1]DashBoard2! → DashBoard2! (COM 저장, 도면 보존)
+    try:
+        master_fixed = repair_master_external_link_refs(master_file)
+        if master_fixed:
+            print(f' 취합용 원본 외부 참조 수정·저장: {len(master_fixed)}건')
+            for _name, coord, old, new in master_fixed[:8]:
+                print(f'   - {_name}!{coord}: {old} → {new}')
+            if len(master_fixed) > 8:
+                print(f'   ... 외 {len(master_fixed) - 8}건')
+        else:
+            print(' 취합용 원본: 외부 참조([n]Sheet!) 수정 대상 없음')
+    except Exception as e:
+        print(f' 취합용 원본 외부 참조 수정 경고(취합은 계속): {e}')
+
+    master_wb = openpyxl.load_workbook(
+        master_file, data_only=False, keep_links=False, keep_vba=False
+    )
+    print(' 취합용 파일 로드')
 
     all_dept_xlsx = [
         f for f in glob.glob(os.path.join(target_folder, '*.xlsx'))
@@ -469,9 +477,28 @@ if __name__ == "__main__":
         purge_xlsx_drawing_parts,
         restore_dashboard_sheets_to_output,
     )
+
+    # Parameter!A6 등: =MATCH([1]DashBoard2!F30,...) → =MATCH(DashBoard2!F30,...)
+    # 깨진 외부 링크가 CHOOSE→OFFSET→SUM 연쇄 #REF!를 만드므로 저장 전 내부 참조로 보정
+    # (DashBoard 제거 전에 변환; 수식 텍스트만 바꾸고 시트 삭제는 openpyxl이 수식을 #REF!로 바꾸지 않음)
+    ext_target = [n for n in master_wb.sheetnames if n == 'Parameter']
+    fixed_ext = strip_external_link_refs(
+        master_wb, sheet_names=ext_target or None,
+    )
+    if fixed_ext:
+        print(f" 외부 참조 → 내부 참조 변환: {len(fixed_ext)}건")
+        for _name, coord, old, new in fixed_ext[:8]:
+            print(f"   - {_name}!{coord}: {old} → {new}")
+        if len(fixed_ext) > 8:
+            print(f"   ... 외 {len(fixed_ext) - 8}건")
+    else:
+        print(" 외부 참조([n]Sheet!) 변환 대상 없음")
+
     removed_dash = strip_dashboard_sheets(master_wb)
     if removed_dash:
-        print(f" openpyxl 안전 저장을 위해 DashBoard 시트 임시 제외: {', '.join(removed_dash)}")
+        print(f" openpyxl 안전 저장을 위해 DashBoard1만 임시 제외: {', '.join(removed_dash)}")
+    else:
+        print(" DashBoard1 제외 대상 없음 (DashBoard2는 유지)")
 
     master_wb.save(output_file)
     master_wb.close()
@@ -482,16 +509,19 @@ if __name__ == "__main__":
         print(f" 도면 잔여 패키지 정리 경고(복원에서 재시도): {e}")
     print(f" 최종 취합본 파일 저장완료 \n -> 경로: {output_file}")
 
-    # 취합용 원본에서 DashBoard(도형·차트·텍스트)를 COM으로 붙임
-    print(" DashBoard 시트 도형·텍스트 복원 중...")
-    try:
-        restored = restore_dashboard_sheets_to_output(master_file, output_file)
-        if restored:
-            print(f" DashBoard 복원 완료: {', '.join(restored)}")
-        else:
-            print(" DashBoard 복원 대상 시트 없음(또는 모두 스킵).")
-    except Exception as e:
-        print(f" DashBoard 복원 실패(숫자/텍스트 취합은 저장됨): {e}")
+    # 제외했던 DashBoard1만 취합용 원본에서 COM으로 붙임 (DashBoard2는 저장본에 유지)
+    if removed_dash:
+        print(" DashBoard1 시트 도형·텍스트 복원 중...")
+        try:
+            restored = restore_dashboard_sheets_to_output(
+                master_file, output_file, sheet_names=removed_dash,
+            )
+            if restored:
+                print(f" DashBoard 복원 완료: {', '.join(restored)}")
+            else:
+                print(" DashBoard1 복원 실패: 시트를 붙이지 못했습니다.")
+        except Exception as e:
+            print(f" DashBoard 복원 실패(숫자/텍스트 취합은 저장됨): {e}")
+    else:
+        print(" DashBoard1 복원 생략 (제외된 시트 없음)")
     print("====================================================")
-
-

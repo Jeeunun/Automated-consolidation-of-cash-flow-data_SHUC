@@ -21,6 +21,8 @@ from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 # ---------------------------------------------------------------------------
 
 DASHBOARD_SHEET_PREFIXES = ('DashBoard', 'Dashboard')
+# openpyxl 저장 전 임시 제외 대상 (DashBoard2는 Parameter 참조 유지 위해 남김)
+STRIP_DASHBOARD_SHEET_NAMES = ('DashBoard1', 'Dashboard1')
 UNIT_LABEL = '(단위 : 백만원)'
 # '(단위 : 백만원)', '(단위:백만원)' 등 표기 변형
 UNIT_LABEL_RE = re.compile(r'단위\s*[:：]?\s*백만')
@@ -587,22 +589,28 @@ def aggregate_dashboard_consolidation(
     return results
 
 
-def strip_dashboard_sheets(workbook) -> list[str]:
+def strip_dashboard_sheets(workbook, sheet_names=None) -> list[str]:
     """
-    openpyxl 워크북에서 DashBoard 시트를 제거한다.
+    openpyxl 워크북에서 DashBoard1 시트만 제거한다.
 
     openpyxl이 차트/도형이 있는 시트를 저장하면 xl/drawings 관계가 깨져
     Excel이 '내용을 복구하시겠습니까?' / Open 오류를 낸다.
-    저장 전에 대시보드 시트를 빼 두고, 저장 후 COM으로 취합용 원본을 붙인다.
+    DashBoard2는 Parameter 등 내부 참조가 있어 남기고, DashBoard1만
+    저장 전 제외한 뒤 COM으로 취합용 원본을 붙인다.
     """
+    targets = set(sheet_names or STRIP_DASHBOARD_SHEET_NAMES)
     removed = [
         name for name in list(workbook.sheetnames)
-        if name.startswith(DASHBOARD_SHEET_PREFIXES)
+        if name in targets
     ]
     for name in removed:
         del workbook[name]
-    # 남은 시트에도 부분적으로 로드된 차트/이미지 참조가 있으면 제거
+    # 제외한 시트 때문에 남은 시트에 깨진 차트/이미지 참조가 있으면 제거
+    # (남기는 DashBoard2 셀 값은 유지 — Parameter 참조용)
+    keep_prefixes = ('DashBoard2', 'Dashboard2')
     for ws in workbook.worksheets:
+        if ws.title.startswith(keep_prefixes):
+            continue
         if hasattr(ws, '_charts'):
             ws._charts = []
         if hasattr(ws, '_images'):
@@ -1116,5 +1124,3 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
-
-
