@@ -39,6 +39,13 @@ def _load_master_values_workbook():
         return openpyxl.load_workbook(
             master_file, data_only=True, keep_links=False, keep_vda=False
         )
+
+    fixed_refs = strip_external_link_refs(master_wb, sheet_names=['Parameter'])
+    if fixed_refs:
+        print(f" 외부참조(끊어진 링크) {len(fixed_refs)}건을 내부참조로 자동 변환:")
+        for sheet, coord, old, new in fixed_refs:
+            print(f"   - {sheet}!{coord}: {old}  ->  {new}")
+    print(' 취합용 파일 로드')
     return None
 
 # ------------------------------------
