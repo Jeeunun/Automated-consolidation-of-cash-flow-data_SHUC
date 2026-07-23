@@ -70,7 +70,8 @@ text_sheets = ["전월대비 비교", f'{prev_year_short}-{int(prev_year_short)+
 # 고정된 폴더 및 파일 경로 설정
 base_path = r'C:\Users\user\Desktop\인턴\3)현금흐름'    ####=====!!!!!!!! 추후 수정해야할 필요있음!!!!!!!======####
 file_name = f'도시개발본부 현금흐름 분석자료({prev_year_short}.{prev_month:02d}.기준)_부서명.xlsx'
-master_file = os.path.join(base_path, file_name)
+file_path = os.path.join(base_path, '취합용파일')
+master_file = os.path.join(file_path, file_name)
 target_folder = os.path.join(base_path, '부서별파일')
 
 # 각 부서 코드(H열 입력값)와 취합용 파일상의 부서명(I열) 매칭 맵
