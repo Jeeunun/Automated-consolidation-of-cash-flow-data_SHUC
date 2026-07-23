@@ -899,6 +899,28 @@ def dept_apply_data_overlays(master_ws, master_map, fix_remap_queue, new_rows_bu
             if is_blue:
                 m_cell.fill = blue_fill
 
+import re
+
+_EXT_LINK_PATTERN = re.compile(r'\[\d+\](?=[^!]+!)')
+
+def strip_external_link_refs(wb, sheet_names=None):
+    '''
+    수식 안의 외부 통합문서 참조([n]SheetName!Cell)를
+    같은 파일 내부 참조(SheetName!Cell)로 변환합니다.
+    예: =MATCH([1]DashBoard2!F30,A3:A5,0) -> =MATCH(DashBoard2!F30,A3:A5,0)
+    '''
+    fixed = []
+    sheets = sheet_names or wb.sheetnames
+    for name in sheets:
+        ws = wb[name]
+        for row in ws.iter_rows():
+            for cell in row:
+                v = cell.value
+                if isinstance(v, str) and v.startswith('=') and _EXT_LINK_PATTERN.search(v):
+                    new_v = _EXT_LINK_PATTERN.sub('', v)
+                    fixed.append((name, cell.coordinate, v, new_v))
+                    cell.value = new_v
+    return fixed
 
 def fix_formulas_after_inserts(ws, inserted_rows, max_col, merge_lookup=None):
     '''
