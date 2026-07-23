@@ -37,7 +37,7 @@ def _load_master_values_workbook():
     '''L열~ 수식의 계산값 스냅샷용 (data_only).'''
     if os.path.exists(master_file):
         return openpyxl.load_workbook(
-            master_file, data_only=True, keep_links=False,
+            master_file, data_only=True, keep_links=False, keep_vda=False
         )
     return None
 
