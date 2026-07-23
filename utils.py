@@ -68,7 +68,7 @@ numeric_sheets = [
 text_sheets = ["전월대비 비교", f'{prev_year_short}-{int(prev_year_short)+1} 지출계획']
 
 # 고정된 폴더 및 파일 경로 설정
-base_path = r'C:\Users\hanjieun_2\OneDrive\바탕 화면\현금흐름'    ####=====!!!!!!!! 추후 수정해야할 필요있음!!!!!!!======####
+base_path = r'C:\Users\Desktop\인턴\3)현금흐름'    ####=====!!!!!!!! 추후 수정해야할 필요있음!!!!!!!======####
 file_name = f'도시개발본부 현금흐름 분석자료({prev_year_short}.{prev_month:02d}.기준)_부서명.xlsx'
 master_file = os.path.join(base_path, file_name)
 target_folder = os.path.join(base_path, '부서별파일')
