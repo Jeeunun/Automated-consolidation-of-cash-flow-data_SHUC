@@ -902,13 +902,27 @@ def dept_apply_data_overlays(master_ws, master_map, fix_remap_queue, new_rows_bu
 
 import re
 
-_EXT_LINK_PATTERN = re.compile(r'\[\d+\](?=[^!]+!)')
+_EXT_LINK_PATTERN = re.compile(r'\[\d+\](?=[^!\]]+!)')
+_EXT_FILE_LINK_PATTERN = re.compile(
+    r"'[^']*\[(?:[^\]]+\.(?:xlsx|xlsm|xlsb|xls))\]([^']+)'!",
+    re.IGNORECASE,
+)
+
+
+def _localize_ext_formula_text(formula: str) -> str | None:
+    '''외부 통합문서 참조 수식 → 내부 시트 참조. 변경 없으면 None.'''
+    if not (isinstance(formula, str) and formula.startswith('=')):
+        return None
+    new_v = _EXT_FILE_LINK_PATTERN.sub(r"'\1'!", formula)
+    new_v = _EXT_LINK_PATTERN.sub('', new_v)
+    return new_v if new_v != formula else None
+
 
 def strip_external_link_refs(wb, sheet_names=None):
     '''
-    수식 안의 외부 통합문서 참조([n]SheetName!Cell)를
-    같은 파일 내부 참조(SheetName!Cell)로 변환합니다.
+    수식 안의 외부 통합문서 참조를 같은 파일 내부 참조로 변환합니다.
     예: =MATCH([1]DashBoard2!F30,A3:A5,0) -> =MATCH(DashBoard2!F30,A3:A5,0)
+        ='C:\\path\\[file.xlsx]취합(2606)'!A1 -> ='취합(2606)'!A1
     '''
     fixed = []
     sheets = sheet_names or wb.sheetnames
@@ -917,10 +931,11 @@ def strip_external_link_refs(wb, sheet_names=None):
         for row in ws.iter_rows():
             for cell in row:
                 v = cell.value
-                if isinstance(v, str) and v.startswith('=') and _EXT_LINK_PATTERN.search(v):
-                    new_v = _EXT_LINK_PATTERN.sub('', v)
-                    fixed.append((name, cell.coordinate, v, new_v))
-                    cell.value = new_v
+                new_v = _localize_ext_formula_text(v) if isinstance(v, str) else None
+                if new_v is None:
+                    continue
+                fixed.append((name, cell.coordinate, v, new_v))
+                cell.value = new_v
     return fixed
 
 
@@ -980,10 +995,9 @@ def repair_master_external_link_refs(path, sheet_names=('Parameter',)):
                         formula = cell.Formula
                     except Exception:
                         continue
-                    if not (isinstance(formula, str) and formula.startswith('=')
-                            and _EXT_LINK_PATTERN.search(formula)):
+                    new_f = _localize_ext_formula_text(formula) if isinstance(formula, str) else None
+                    if new_f is None:
                         continue
-                    new_f = _EXT_LINK_PATTERN.sub('', formula)
                     cell.Formula = new_f
                     coord = cell.Address.replace('$', '')
                     fixed.append((name, coord, formula, new_f))

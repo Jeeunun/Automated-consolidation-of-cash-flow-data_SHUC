@@ -21,8 +21,25 @@ from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 # ---------------------------------------------------------------------------
 
 DASHBOARD_SHEET_PREFIXES = ('DashBoard', 'Dashboard')
-# openpyxl 저장 전 임시 제외 대상 (DashBoard2는 Parameter 참조 유지 위해 남김)
-STRIP_DASHBOARD_SHEET_NAMES = ('DashBoard1', 'Dashboard1')
+# openpyxl 저장 전 임시 제외 → 저장 후 COM으로 원본에서 복원
+STRIP_DASHBOARD_SHEET_NAMES = (
+    'DashBoard1', 'Dashboard1', 'DashBoard2', 'Dashboard2',
+)
+# COM Copy 후 외부 통합문서 참조 → 같은 파일 내부 시트로
+#  1) ='C:\path\[file.xlsx]Sheet'!A1  → ='Sheet'!A1
+#  2) ='[1]Sheet'!A1 / =[1]Sheet!A1   → ='Sheet'!A1 / =Sheet!A1
+_COM_FILE_EXT_RE = re.compile(
+    r"'[^']*\[(?:[^\]]+\.(?:xlsx|xlsm|xlsb|xls))\]([^']+)'!",
+    re.IGNORECASE,
+)
+_COM_INDEX_EXT_RE = re.compile(r'\[\d+\](?=[^!\]]+!)')
+_PARAMETER_DASHBOARD_MATCH = {
+    'A6': '=MATCH(DashBoard2!F30,A3:A5,0)',
+    'B6': '=MATCH(DashBoard2!F31,B3:B5,0)',
+    'C6': '=MATCH(DashBoard2!F32,C3:C5,0)',
+    'D6': '=MATCH(DashBoard2!F33,D3:D5,0)',
+    'E6': '=MATCH(DashBoard2!F34,E3:E5,0)',
+}
 UNIT_LABEL = '(단위 : 백만원)'
 # '(단위 : 백만원)', '(단위:백만원)' 등 표기 변형
 UNIT_LABEL_RE = re.compile(r'단위\s*[:：]?\s*백만')
@@ -591,12 +608,12 @@ def aggregate_dashboard_consolidation(
 
 def strip_dashboard_sheets(workbook, sheet_names=None) -> list[str]:
     """
-    openpyxl 워크북에서 DashBoard1 시트만 제거한다.
+    openpyxl 워크북에서 DashBoard1/2 시트를 제거한다.
 
     openpyxl이 차트/도형이 있는 시트를 저장하면 xl/drawings 관계가 깨져
     Excel이 '내용을 복구하시겠습니까?' / Open 오류를 낸다.
-    DashBoard2는 Parameter 등 내부 참조가 있어 남기고, DashBoard1만
-    저장 전 제외한 뒤 COM으로 취합용 원본을 붙인다.
+    저장 전에 빼고, 저장 후 COM으로 취합용 원본을 붙인 뒤
+    Copy가 만든 [n]Sheet! 외부참조를 내부참조로 되돌린다.
     """
     targets = set(sheet_names or STRIP_DASHBOARD_SHEET_NAMES)
     removed = [
@@ -606,16 +623,100 @@ def strip_dashboard_sheets(workbook, sheet_names=None) -> list[str]:
     for name in removed:
         del workbook[name]
     # 제외한 시트 때문에 남은 시트에 깨진 차트/이미지 참조가 있으면 제거
-    # (남기는 DashBoard2 셀 값은 유지 — Parameter 참조용)
-    keep_prefixes = ('DashBoard2', 'Dashboard2')
     for ws in workbook.worksheets:
-        if ws.title.startswith(keep_prefixes):
-            continue
         if hasattr(ws, '_charts'):
             ws._charts = []
         if hasattr(ws, '_images'):
             ws._images = []
     return removed
+
+
+def _localize_external_formula(formula: str) -> str | None:
+    """외부 통합문서 참조 수식을 내부 시트 참조로 바꾼다. 변경 없으면 None."""
+    if not (isinstance(formula, str) and formula.startswith('=')):
+        return None
+    new_f = _COM_FILE_EXT_RE.sub(r"'\1'!", formula)
+    new_f = _COM_INDEX_EXT_RE.sub('', new_f)
+    return new_f if new_f != formula else None
+
+
+def _com_localize_external_sheet_refs(workbook, sheet_names=None) -> int:
+    """
+    COM 워크북 수식의 외부 통합문서 참조를 같은 파일 내부 시트로 바꾼다.
+
+    DashBoard를 다른 통합문서에서 Copy하면 Excel이 시트 참조를
+    'C:\\...\\[취합용.xlsx]취합(2606)'! 형태로 바꿔, 값이 원본 파일을
+    따라가거나 링크가 없으면 깨진다.
+    """
+    if sheet_names is None:
+        names = [
+            workbook.Worksheets(i).Name
+            for i in range(1, workbook.Worksheets.Count + 1)
+        ]
+    else:
+        names = list(sheet_names)
+
+    fixed = 0
+    for name in names:
+        try:
+            ws = workbook.Worksheets(name)
+        except Exception:
+            continue
+        try:
+            used = ws.UsedRange
+            row0, col0 = int(used.Row), int(used.Column)
+        except Exception:
+            continue
+
+        try:
+            formulas = used.Formula
+        except Exception:
+            continue
+        if formulas is None:
+            continue
+        if not isinstance(formulas, tuple):
+            formulas = ((formulas,),)
+
+        for i, row in enumerate(formulas):
+            if not isinstance(row, tuple):
+                row = (row,)
+            for j, formula in enumerate(row):
+                new_f = _localize_external_formula(formula)
+                if new_f is None:
+                    continue
+                ws.Cells(row0 + i, col0 + j).Formula = new_f
+                fixed += 1
+    return fixed
+
+
+def _com_ensure_parameter_dashboard_links(workbook) -> int:
+    """Parameter!A6:E6이 DashBoard2를 내부 참조하도록 고정 (제외·복원 후 #REF! 방지)."""
+    try:
+        ws = workbook.Worksheets('Parameter')
+    except Exception:
+        return 0
+    fixed = 0
+    for addr, formula in _PARAMETER_DASHBOARD_MATCH.items():
+        cell = ws.Range(addr)
+        try:
+            cur = cell.Formula
+        except Exception:
+            cur = None
+        if cur != formula:
+            cell.Formula = formula
+            fixed += 1
+    return fixed
+
+
+def _com_finalize_dashboard_links(workbook) -> int:
+    """복원 직후: [n]외부참조 제거 + Parameter↔DashBoard2 링크 보장."""
+    n_loc = _com_localize_external_sheet_refs(workbook)
+    n_param = _com_ensure_parameter_dashboard_links(workbook)
+    if n_loc:
+        print(f'  DashBoard 외부참조 로컬화: 셀 {n_loc}건')
+    if n_param:
+        print(f'  Parameter↔DashBoard2 내부참조 보정: {n_param}건')
+    return n_loc + n_param
 
 
 def purge_xlsx_drawing_parts(xlsx_path: str) -> None:
@@ -919,6 +1020,7 @@ def _rebuild_output_with_dashboards_via_com(excel_app, master_path, output_path,
         data_wb = None
 
         restored = _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names)
+        _com_finalize_dashboard_links(out_wb)
 
         if os.path.isfile(clean_path):
             try:
@@ -1027,19 +1129,20 @@ def restore_dashboard_sheets_to_output(master_path, output_path, sheet_names=Non
 
         excel_app.DisplayAlerts = False
         restored = _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names)
+        # Copy가 만든 [1]취합... 외부참조 → 같은 파일 내부 시트로 되돌림
+        _com_finalize_dashboard_links(out_wb)
 
-        if restored:
-            if os.path.isfile(clean_path):
-                try:
-                    os.remove(clean_path)
-                except OSError:
-                    pass
-            out_wb.SaveAs(clean_path, FileFormat=xl_openxml)
-            out_wb.Close(SaveChanges=False)
-            out_wb = None
-            mas_wb.Close(SaveChanges=False)
-            mas_wb = None
-            shutil.copy2(clean_path, output_path)
+        if os.path.isfile(clean_path):
+            try:
+                os.remove(clean_path)
+            except OSError:
+                pass
+        out_wb.SaveAs(clean_path, FileFormat=xl_openxml)
+        out_wb.Close(SaveChanges=False)
+        out_wb = None
+        mas_wb.Close(SaveChanges=False)
+        mas_wb = None
+        shutil.copy2(clean_path, output_path)
     finally:
         if out_wb is not None:
             try:
