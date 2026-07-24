@@ -34,11 +34,13 @@ _COM_FILE_EXT_RE = re.compile(
 )
 _COM_INDEX_EXT_RE = re.compile(r'\[\d+\](?=[^!\]]+!)')
 _PARAMETER_DASHBOARD_MATCH = {
-    'A6': '=MATCH(DashBoard2!F30,A3:A5,0)',
-    'B6': '=MATCH(DashBoard2!F31,B3:B5,0)',
-    'C6': '=MATCH(DashBoard2!F32,C3:C5,0)',
-    'D6': '=MATCH(DashBoard2!F33,D3:D5,0)',
-    'E6': '=MATCH(DashBoard2!F34,E3:E5,0)',
+    # 따옴표로 로컬 시트 강제 — LinkSources에 'DashBoard2' 잔존 시
+    # DashBoard2!F30 이 외부링크로 묶여 #REF!가 나는 것을 막음
+    'A6': "=MATCH('DashBoard2'!F30,A3:A5,0)",
+    'B6': "=MATCH('DashBoard2'!F31,B3:B5,0)",
+    'C6': "=MATCH('DashBoard2'!F32,C3:C5,0)",
+    'D6': "=MATCH('DashBoard2'!F33,D3:D5,0)",
+    'E6': "=MATCH('DashBoard2'!F34,E3:E5,0)",
 }
 UNIT_LABEL = '(단위 : 백만원)'
 # '(단위 : 백만원)', '(단위:백만원)' 등 표기 변형
@@ -690,7 +692,7 @@ def _com_localize_external_sheet_refs(workbook, sheet_names=None) -> int:
 
 
 def _com_ensure_parameter_dashboard_links(workbook) -> int:
-    """Parameter!A6:E6이 DashBoard2를 내부 참조하도록 고정 (제외·복원 후 #REF! 방지)."""
+    """Parameter!A6:E6이 로컬 DashBoard2 시트를 참조하도록 고정 (제외·복원 후 #REF! 방지)."""
     try:
         ws = workbook.Worksheets('Parameter')
     except Exception:
@@ -708,15 +710,51 @@ def _com_ensure_parameter_dashboard_links(workbook) -> int:
     return fixed
 
 
+def _com_drop_phantom_dashboard_links(workbook) -> int:
+    """
+    COM Copy 과정에서 생긴 'DashBoard2' 이름의 가짜 외부 링크를 제거한다.
+
+    시트 DashBoard2와 링크 이름 DashBoard2가 동시에 있으면
+    Parameter의 MATCH(DashBoard2!F30)이 시트가 아니라 깨진 외부링크로
+    묶여 #REF!가 난다. 수식을 로컬화한 뒤 해당 링크만 BreakLink.
+    """
+    try:
+        links = workbook.LinkSources(1)  # xlExcelLinks
+    except Exception:
+        return 0
+    if not links:
+        return 0
+    if isinstance(links, str):
+        links = (links,)
+
+    phantom_names = {
+        'DashBoard1', 'DashBoard2', 'Dashboard1', 'Dashboard2',
+    }
+    dropped = 0
+    for link in links:
+        name = str(link)
+        base = os.path.basename(name)
+        if name not in phantom_names and base not in phantom_names:
+            continue
+        try:
+            workbook.BreakLink(Name=name, Type=1)
+            dropped += 1
+            print(f'  잔존 외부링크 제거: {name}')
+        except Exception as e:
+            print(f'  외부링크 제거 실패({name}): {e}')
+    return dropped
+
+
 def _com_finalize_dashboard_links(workbook) -> int:
-    """복원 직후: [n]외부참조 제거 + Parameter↔DashBoard2 링크 보장."""
+    """복원 직후: [n]/경로 외부참조 제거 + Parameter↔DashBoard2 링크 보장 + 가짜 링크 삭제."""
     n_loc = _com_localize_external_sheet_refs(workbook)
     n_param = _com_ensure_parameter_dashboard_links(workbook)
+    n_drop = _com_drop_phantom_dashboard_links(workbook)
     if n_loc:
         print(f'  DashBoard 외부참조 로컬화: 셀 {n_loc}건')
     if n_param:
         print(f'  Parameter↔DashBoard2 내부참조 보정: {n_param}건')
-    return n_loc + n_param
+    return n_loc + n_param + n_drop
 
 
 def purge_xlsx_drawing_parts(xlsx_path: str) -> None:
@@ -1227,3 +1265,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+
