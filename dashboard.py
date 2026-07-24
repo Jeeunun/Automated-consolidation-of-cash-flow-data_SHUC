@@ -9,7 +9,8 @@ import os
 import re
 import sys
 from contextlib import contextmanager
-
+import datetime
+from datetime import timedelta
 import pandas as pd
 import win32com.client as win32
 from openpyxl import Workbook
@@ -592,7 +593,13 @@ def aggregate_dashboard_consolidation(
             safe_sheet = re.sub(r'[\\/:*?"<>|]', '_', sheet_name)
             folder_file = os.path.join(output_dir, '최종취합본')
             os.makedirs(folder_file, exist_ok=True)
-            xlsx_path = os.path.join(folder_file, f'dashboard_{safe_sheet}_취합본.xlsx')
+
+            # 1단계: 오늘 날짜 기준으로 이번 달의 1일을 구합니다.
+            first_day_of_this_month = datetime.today().replace(day=1)
+            last_day_of_prev_month = first_day_of_this_month - timedelta(days=1)
+            prev_year_short = last_day_of_prev_month.strftime('%y')
+            prev_month = last_day_of_prev_month.month
+            xlsx_path = os.path.join(folder_file, f'dashboard_{safe_sheet}_취합본({prev_year_short}.{prev_month:02d}).xlsx')
 
             save_consolidated_xlsx(consolidated, xlsx_path)
 
