@@ -449,7 +449,7 @@ if __name__ == "__main__":
     else:
         aggregate_text_sheets(master_wb, dept_wbook_list, text_sheets)
 
-    print(' DashBoard 텍스트 취합 시작. (DashBoard1만 — DashBoard2 취합본 미생성)')
+    print(' DashBoard 텍스트 취합 시작. (DashBoard1만)')
     from dashboard import aggregate_dashboard_consolidation
     aggregate_dashboard_consolidation(
         master_path=master_file,

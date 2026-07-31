@@ -9,8 +9,7 @@ import os
 import re
 import sys
 from contextlib import contextmanager
-import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta
 import pandas as pd
 import win32com.client as win32
 from openpyxl import Workbook
@@ -50,6 +49,10 @@ STATUS_EXISTING = '기존'
 STATUS_DEPT_ADD = '부서추가'
 FILL_DEPT_ADD = PatternFill(start_color='FF6666', end_color='FF6666', fill_type='solid')
 HEADER_FONT = Font(bold=True)
+
+# Excel Validation.Type (목록형 드롭다운)
+XL_VALIDATE_LIST = 3
+XL_VALID_ALERT_STOP = 1
 
 OUTPUT_COLUMNS = [
     'status', 'source_file', 'chart_title', 'chart_name', 'text',
@@ -546,6 +549,15 @@ def save_consolidated_xlsx(df: pd.DataFrame, xlsx_path: str):
     wb.save(xlsx_path)
 
 
+def _prev_month_stamp():
+    first_day_of_this_month = datetime.today().replace(day=1)
+    last_day_of_prev_month = first_day_of_this_month - timedelta(days=1)
+    return (
+        last_day_of_prev_month.strftime('%y'),
+        last_day_of_prev_month.month,
+    )
+
+
 def aggregate_dashboard_consolidation(
     master_path,
     dept_paths,
@@ -554,6 +566,7 @@ def aggregate_dashboard_consolidation(
     ):
     """
     취합용 + 부서 DashBoard 텍스트 추출·diff·취합본 XLSX 저장.
+    (데이터 유효성 드롭다운은 최종취합본 COM 복원 시 취합용에서 그대로 복사)
 
     Returns:
         dict[sheet_name] -> {'xlsx': path, 'add_count': int}
@@ -594,12 +607,11 @@ def aggregate_dashboard_consolidation(
             folder_file = os.path.join(output_dir, '최종취합본')
             os.makedirs(folder_file, exist_ok=True)
 
-            # 1단계: 오늘 날짜 기준으로 이번 달의 1일을 구합니다.
-            first_day_of_this_month = datetime.today().replace(day=1)
-            last_day_of_prev_month = first_day_of_this_month - timedelta(days=1)
-            prev_year_short = last_day_of_prev_month.strftime('%y')
-            prev_month = last_day_of_prev_month.month
-            xlsx_path = os.path.join(folder_file, f'dashboard_{safe_sheet}_취합본({prev_year_short}.{prev_month:02d}).xlsx')
+            prev_year_short, prev_month = _prev_month_stamp()
+            xlsx_path = os.path.join(
+                folder_file,
+                f'dashboard_{safe_sheet}_취합본({prev_year_short}.{prev_month:02d}).xlsx',
+            )
 
             save_consolidated_xlsx(consolidated, xlsx_path)
 
@@ -896,6 +908,58 @@ def _com_dump_openpyxl_sheet(py_ws, com_ws, chunk_rows=250):
             pass
 
 
+def _com_copy_list_validations(src_ws, dst_ws) -> int:
+    """
+    취합용 시트의 목록형 데이터 유효성(드롭다운)을 최종본 시트로 다시 건다.
+    Sheet.Copy만으로도 보통 따라오지만, openpyxl 잔여 시트/링크 정리 후에도
+    드롭다운이 남도록 명시적으로 재적용한다.
+    """
+    try:
+        used = src_ws.UsedRange
+        row0, col0 = int(used.Row), int(used.Column)
+        n_rows, n_cols = int(used.Rows.Count), int(used.Columns.Count)
+    except Exception:
+        return 0
+
+    copied = 0
+    for r in range(row0, row0 + n_rows):
+        for c in range(col0, col0 + n_cols):
+            src_cell = src_ws.Cells(r, c)
+            try:
+                if int(src_cell.Validation.Type) != XL_VALIDATE_LIST:
+                    continue
+                formula1 = str(src_cell.Validation.Formula1 or '')
+            except Exception:
+                continue
+            if not formula1:
+                continue
+
+            # 외부 통합문서 경로가 Formula1에 있으면 내부 참조로
+            loc = _localize_external_formula('=' + formula1.lstrip('='))
+            if loc is not None:
+                formula1 = loc[1:] if loc.startswith('=') else loc
+
+            dst_cell = dst_ws.Cells(r, c)
+            try:
+                dst_cell.Validation.Delete()
+            except Exception:
+                pass
+            try:
+                dst_cell.Validation.Add(
+                    Type=XL_VALIDATE_LIST,
+                    AlertStyle=XL_VALID_ALERT_STOP,
+                    Operator=1,
+                    Formula1=formula1,
+                )
+                dst_cell.Validation.IgnoreBlank = True
+                dst_cell.Validation.InCellDropdown = True
+                dst_cell.Validation.ShowError = True
+                copied += 1
+            except Exception:
+                continue
+    return copied
+
+
 def _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names):
     """취합용 mas_wb의 DashBoard 시트를 out_wb 맨 뒤에 붙인다."""
     restored = []
@@ -986,6 +1050,7 @@ def _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names):
                 new_ws.Name = sheet_name
 
             ws = new_ws
+            n_dv = _com_copy_list_validations(src, ws)
             n_shapes = int(ws.Shapes.Count)
             n_charts = int(ws.ChartObjects().Count)
             chart_shapes = 0
@@ -997,7 +1062,8 @@ def _com_attach_dashboard_sheets(excel_app, mas_wb, out_wb, sheet_names):
             restored.append(sheet_name)
             print(
                 f'  [{sheet_name}] 복원 완료 '
-                f'(시트도형 {n_shapes}, 차트 {n_charts}, 차트내도형 {chart_shapes})'
+                f'(시트도형 {n_shapes}, 차트 {n_charts}, 차트내도형 {chart_shapes}'
+                f', 드롭다운 {n_dv}건)'
             )
         except Exception as e:
             import traceback
